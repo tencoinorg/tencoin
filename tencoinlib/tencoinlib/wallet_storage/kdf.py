@@ -37,6 +37,14 @@ _SALT_LEN             = 32     # 256-bit salt
 # KDF ID byte used in the TCW header
 KDF_ID_ARGON2ID = 0x01
 
+# KDF ID byte used in the ESP TCE1 blob header (see wallet_storage/tce.py).
+# ESP32 cannot run Argon2id (64 MiB RAM requirement), so the ESP-side
+# format uses PBKDF2-HMAC-SHA256 with a hard cap on iterations instead.
+KDF_ID_PBKDF2_SHA256 = 0x02
+PBKDF2_MIN_ITERATIONS = 1
+PBKDF2_MAX_ITERATIONS = 10_000   # ESP32 ceiling — see ESP_WALLET_STRUCTURE.md
+PBKDF2_SALT_LEN = 16
+
 
 @dataclass(frozen=True)
 class KDFParams:
@@ -134,3 +142,54 @@ def verify_password_strength(password: str) -> None:
     """
     if len(password) < 8:
         raise ValueError("Wallet password must be at least 8 characters")
+
+
+# ---------------------------------------------------------------------------
+# PBKDF2-HMAC-SHA256  (ESP32 TCE1 blob format — see wallet_storage/tce.py)
+# ---------------------------------------------------------------------------
+#
+# ESP32 has ~100-300 KiB of free heap with WiFi + web server running, which
+# rules out Argon2id at any parameter set that would still be meaningfully
+# resistant to attack (its 64 MiB default is already far out of reach, and
+# a "light" multi-MiB variant still needs PSRAM and a fresh Argon2
+# implementation the firmware doesn't have). ESP32 therefore uses
+# PBKDF2-HMAC-SHA256, capped at PBKDF2_MAX_ITERATIONS so a legitimate
+# unlock stays within a few seconds on that hardware. This is a weaker KDF
+# than Argon2id — see the security notes in ESP_WALLET_STRUCTURE.md — so
+# ESP-bound wallets should use a strong, high-entropy password.
+
+def generate_pbkdf2_salt() -> bytes:
+    """Return a fresh cryptographically-random 16-byte salt (ESP TCE1 format)."""
+    return os.urandom(PBKDF2_SALT_LEN)
+
+
+def derive_key_pbkdf2(password: str, salt: bytes, iterations: int) -> bytes:
+    """
+    Derive a 32-byte AES-256 key from *password* using PBKDF2-HMAC-SHA256.
+
+    This matches mbedtls_pkcs5_pbkdf2_hmac(MBEDTLS_MD_SHA256, ...) byte
+    for byte, so keys derived here and on the ESP32 firmware are
+    interchangeable given the same password/salt/iterations.
+
+    Args:
+        password:   User-supplied passphrase (unicode string).
+        salt:       Random bytes stored in the TCE1 header (16 bytes).
+        iterations: PBKDF2 iteration count, 1..PBKDF2_MAX_ITERATIONS.
+
+    Returns:
+        32-byte key suitable for AES-256-GCM.
+
+    Raises:
+        ValueError: If salt length or iteration count is out of range.
+    """
+    if len(salt) != PBKDF2_SALT_LEN:
+        raise ValueError(f"PBKDF2 salt must be {PBKDF2_SALT_LEN} bytes, got {len(salt)}")
+    if not (PBKDF2_MIN_ITERATIONS <= iterations <= PBKDF2_MAX_ITERATIONS):
+        raise ValueError(
+            f"PBKDF2 iterations must be between {PBKDF2_MIN_ITERATIONS} and "
+            f"{PBKDF2_MAX_ITERATIONS} (ESP32 ceiling), got {iterations}"
+        )
+
+    import hashlib
+    password_bytes = password.encode("utf-8")
+    return hashlib.pbkdf2_hmac("sha256", password_bytes, salt, iterations, dklen=_KEY_LEN)

@@ -1,10 +1,25 @@
-from .core import Transaction, TxIn, TxOut, parse_transaction
+from .core import Transaction, TxIn, TxOut, TimelockTxOut, HashlockTxOut, parse_transaction
 from .builder import TransactionBuilder, TransactionBuilderError
 from .signer import (
     SegWitSigner,
     LegacySigner,
     TransactionSigner,
     SigningError,
+)
+from .hashlock import (
+    HashlockError,
+    InvalidHashlockSecretError,
+    InvalidHashlockUTXOError,
+    HashlockSpendBuildError,
+    HashlockSpendSigningError,
+    PreparedHashlockSecret,
+    HashlockSpendResult,
+    prepare_hashlock_secret,
+    verify_hashlock_secret,
+    build_hashlock_spend,
+    sign_hashlock_input,
+    finalize_hashlock_spend,
+    spend_hashlock,
 )
 from .fee import FeeCalculator
 from .address import (
@@ -26,6 +41,8 @@ __all__ = [
     "Transaction",
     "TxIn",
     "TxOut",
+    "TimelockTxOut",
+    "HashlockTxOut",
     "parse_transaction",
     # Builder
     "TransactionBuilder",
@@ -35,6 +52,20 @@ __all__ = [
     "LegacySigner",
     "TransactionSigner",
     "SigningError",
+    # Hashlock spending
+    "HashlockError",
+    "InvalidHashlockSecretError",
+    "InvalidHashlockUTXOError",
+    "HashlockSpendBuildError",
+    "HashlockSpendSigningError",
+    "PreparedHashlockSecret",
+    "HashlockSpendResult",
+    "prepare_hashlock_secret",
+    "verify_hashlock_secret",
+    "build_hashlock_spend",
+    "sign_hashlock_input",
+    "finalize_hashlock_spend",
+    "spend_hashlock",
     # Fee
     "FeeCalculator",
     # Address
@@ -43,7 +74,7 @@ __all__ = [
     "is_valid_address",
     "get_address_type",
     "AddressError",
-    # Script (P2PKH, P2SH, P2WSH, multisig)
+    # Script
     "build_p2pkh_script",
     "build_multisig_script",
     "script_to_p2sh_address",

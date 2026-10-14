@@ -9,8 +9,10 @@ import http.client
 from ..constants import DEFAULT_RPC_PORT, DEFAULT_RPC_TOKEN
 from .exceptions import (
     RPCError, ConnectionError, AuthenticationError, 
-    TimeoutError, ResponseError, InvalidMethodError
+    TimeoutError, ResponseError, InvalidMethodError,
+    PublicKeyNotFoundError
 )
+from .publickey import PublicKeyInfo, parse_get_public_key_response
 
 class RPCClient:
     """
@@ -210,6 +212,36 @@ class RPCClient:
         result = self._make_request("gettransaction", {"txid": txid})
         return result.get("hex", "")
     
+    def get_public_key(self, address: str) -> PublicKeyInfo:
+        """
+        Find the public key of an address on the blockchain (node command ``getpublickey``).
+
+        An address is only the HASH160 of a key. The key itself appears on-chain the first
+        time the address spends an output (in the scriptSig or witness), so an address that
+        never spent has no public key to find.
+
+        The returned key is checked locally: it must hash to ``address``, otherwise
+        PublicKeyVerificationError is raised and the node's answer is not used.
+
+        Args:
+            address: Tencoin address (tc1q..., P2PKH or P2SH-P2WPKH)
+
+        Returns:
+            PublicKeyInfo (``.public_key``, ``.compressed``, ``.format``, ``.txid``,
+            ``.input_index``, ``.location``, ``.height``)
+
+        Raises:
+            PublicKeyNotFoundError:     the address has never been used as a spending input
+            PublicKeyVerificationError: the node's key does not match the address
+        """
+        try:
+            result = self._make_request("getpublickey", {"address": address})
+        except ResponseError as exc:
+            if "no public key" in str(exc).lower():
+                raise PublicKeyNotFoundError(address) from exc
+            raise
+        return parse_get_public_key_response(address, result)
+
     # --- Blockchain Methods ---
     
     def get_block_count(self) -> int:

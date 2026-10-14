@@ -4,7 +4,12 @@ Tencoin Message Signing - Bitcoin Core Compatible
 
 Format:
     Magic Prefix: \x18Tencoin Signed Message:\n
-    Output: Base64 (65 bytes)
+    Output: Base64 (65 bytes) = header (1) || r (32) || s (32)
+            header = 31 + recovery_id for a compressed public key
+            (27 + recovery_id is accepted when verifying uncompressed keys)
+
+The header byte comes first, exactly as in Bitcoin Core. For compressed keys it
+is 31..34, so the Base64 text always starts with 'H' (31) or 'I' (32-34).
 """
 
 import base64
@@ -122,7 +127,7 @@ def sign_message(private_key: bytes, message: str) -> str:
         recovery_id = recoverable_sig[64] % 4
         bitcoin_rec_id = 31 + recovery_id
 
-        final_sig = recoverable_sig[:64] + bytes([bitcoin_rec_id])
+        final_sig = bytes([bitcoin_rec_id]) + recoverable_sig[:64]
         return base64.b64encode(final_sig).decode("ascii")
 
     except Exception as e:
@@ -168,7 +173,7 @@ def verify_message(address: str, message: str, signature_b64: str) -> bool:
             f"Signature must be 65 bytes, got {len(sig_bytes)}"
         )
 
-    rec_byte = sig_bytes[64]
+    rec_byte = sig_bytes[0]
 
     if 31 <= rec_byte <= 34:
         recovery_id = rec_byte - 31
@@ -181,7 +186,7 @@ def verify_message(address: str, message: str, signature_b64: str) -> bool:
             f"Invalid recovery byte: {rec_byte} (expected 27-34)"
         )
 
-    verify_sig = sig_bytes[:64] + bytes([recovery_id])
+    verify_sig = sig_bytes[1:65] + bytes([recovery_id])
     msg_hash = _message_hash(message)
 
     try:
@@ -229,7 +234,7 @@ def recover_address_from_signature(
         if len(sig_bytes) != 65:
             return None
 
-        rec_byte = sig_bytes[64]
+        rec_byte = sig_bytes[0]
         if 31 <= rec_byte <= 34:
             recovery_id = rec_byte - 31
             compressed = True
@@ -239,7 +244,7 @@ def recover_address_from_signature(
         else:
             return None
 
-        verify_sig = sig_bytes[:64] + bytes([recovery_id])
+        verify_sig = sig_bytes[1:65] + bytes([recovery_id])
         msg_hash = _message_hash(message)
 
         recovered_pubkey = CoincurvePublicKey.from_signature_and_message(

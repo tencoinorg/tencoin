@@ -12,16 +12,18 @@ Complete and comprehensive documentation for the Tencoinlib Python library.
 6. [Transactions](#transactions)
 7. [RPC Client](#rpc-client)
 8. [Address Utilities](#address-utilities)
-9. [Fee Management](#fee-management)
+9. [Fee Management](#fee-management) — includes `set_fee()` and Timelock Outputs
 10. [Key Management](#key-management)
 11. [Transaction Signing](#transaction-signing)
 12. [Multisig Transactions](#multisig-transactions)
 13. [Message Signing](#message-signing)
-14. [Complete Examples](#complete-examples)
-15. [API Reference](#api-reference)
-16. [Error Handling](#error-handling)
-17. [Constants and Configuration](#constants-and-configuration)
-18. [Best Practices](#best-practices)
+14. [HASHLOCK (C2) Outputs](#hashlock-c2-outputs) — TCS secrets, creating and spending
+15. [TMSG (Tencoin Message)](#tmsg-tencoin-message) — encrypted messages, files and folders, off-chain and on-chain
+16. [Complete Examples](#complete-examples)
+17. [API Reference](#api-reference)
+18. [Error Handling](#error-handling)
+19. [Constants and Configuration](#constants-and-configuration)
+20. [Best Practices](#best-practices)
 
 ---
 
@@ -34,15 +36,21 @@ Complete and comprehensive documentation for the Tencoinlib Python library.
 - ✅ **HD Wallets**: Full support for BIP-39 (mnemonic phrases) + BIP-84 (SegWit addresses)
 - ✅ **BIP-32 Extended Keys**: Master/account-level xprv/xpub with standard serialization
 - ✅ **Watch-Only Wallets**: Create wallets from xpub only (no seed/private keys)
+- ✅ **Raw Key Import**: Create a wallet from a single raw private key (no mnemonic, no chain code)
 - ✅ **Multiple Address Types**: 
-  - **SegWit v0** (P2WPKH): Native SegWit addresses (`tc1q...`)
-  - **Legacy P2PKH**: Pay-to-pubkey-hash addresses (`T...`)
-  - **Legacy P2SH**: Pay-to-script-hash addresses (`M...`)
+  - **SegWit v0** (P2WPKH): Native SegWit addresses (`tc1q...`), BIP-84
+  - **Legacy P2PKH**: Pay-to-pubkey-hash addresses (`T...`), BIP-44
+  - **Nested SegWit P2SH** (P2SH-P2WPKH): Pay-to-script-hash-wrapped SegWit addresses (`M...`), BIP-49
   - **P2WSH**: SegWit script addresses (`tc1q...` with 32-byte program)
+- ✅ **Independent BIP-44 / BIP-49 / BIP-84 Purpose Fields**: Legacy, nested-SegWit, and native-SegWit addresses each derive under their own purpose (44'/49'/84'), with dedicated account-level xprv/xpub for each
 - ✅ **Custom Scripts**: Support for multisig and custom redeem/witness scripts
 - ✅ **Transaction Signing**: Automatic detection and signing for SegWit (BIP-143), Legacy (P2PKH/P2SH), and Multisig (P2SH/P2WSH, any m-of-n up to 15-of-15) inputs
 - ✅ **Message Signing**: Bitcoin Core–compatible message signing and verification with public key recovery
-- ✅ **Key Derivation**: Standard BIP-84 derivation path `m/84'/5353'/0'/0/0` + generic BIP-32 paths
+- ✅ **HASHLOCK (C2) Outputs**: Create hash-locked outputs and spend them (owner signature + secret preimage) — in one call with `wallet.spend_hashlock()` or step by step
+- ✅ **TMSG (Tencoin Message)**: Encrypt messages, files and folders to one public key (v1) or many (v2, any one private key decrypts) — off-chain, or on-chain in an `OP_RETURN` output (up to 958 bytes of message)
+- ✅ **getpublickey**: Find the public key of an address on-chain (`rpc.get_public_key()`), verified locally against the address
+- ✅ **TCS Secrets**: Generate and validate `TCS-...` secrets (64 characters including a checksum) in exactly the format used by Tencoin Core
+- ✅ **Key Derivation**: Standard BIP-84 derivation path `m/84'/5353'/0'/0/0`, BIP-44 path `m/44'/5353'/0'/0/0`, BIP-49 path `m/49'/5353'/0'/0/0`, and generic BIP-32 paths
 - ✅ **Mnemonic Phrases**: 12, 15, 18, 21, or 24 word English mnemonics
 - ✅ **Wallet Recovery**: Restore wallets from mnemonic phrases
 - ✅ **Encrypted Wallet Storage**: TCW v1 binary format with AES-256-GCM encryption and Argon2id key derivation
@@ -56,6 +64,8 @@ Complete and comprehensive documentation for the Tencoinlib Python library.
 
 - **BIP-39**: Mnemonic code for generating deterministic keys
 - **BIP-32**: Hierarchical Deterministic Wallets
+- **BIP-44**: Derivation scheme for legacy P2PKH addresses
+- **BIP-49**: Derivation scheme for nested SegWit (P2SH-P2WPKH) addresses
 - **BIP-84**: Derivation scheme for P2WPKH (SegWit v0)
 - **BIP-143**: Transaction signature verification for SegWit
 - **BIP-13**: Pay-to-script-hash (P2SH)
@@ -92,7 +102,7 @@ pip install tencoinlib[mnemonic]
 - `bech32>=1.2.0` - For SegWit address encoding
 - `coincurve>=13.0.0` - For message signing and public key recovery
 - `cryptography>=41.0.0` - For AES-256-GCM wallet encryption
-- `argon2-cffi>=21.3.0` - For Argon2id key derivation
+- `argon2-cffi>=21.3.0` - For Argon2id key derivation (`.tcw` files)
 
 ---
 
@@ -217,7 +227,8 @@ wallet = Wallet.recover(mnemonic, passphrase="my-secret-passphrase")
 address = wallet.get_address()
 print(f"Address: {address}")  # e.g., "tc1q..."
 
-# Same key as other address types (P2PKH, P2SH)
+# Note: P2PKH/P2SH/P2WPKH are derived under independent purpose fields
+# (BIP-44/49/84) — NOT the same key. See the note under Address Types.
 print("SegWit:  ", wallet.get_address())              # tc1q...
 print("P2PKH:   ", wallet.get_address("p2pkh"))       # T...
 print("P2SH:    ", wallet.get_address("p2sh"))        # M... (single-sig P2SH)
@@ -247,18 +258,29 @@ The `get_address()` method supports multiple address types and custom scripts (m
 ```python
 wallet = Wallet.create()
 
-# SegWit v0 native (P2WPKH) - default
+# SegWit v0 native (P2WPKH) - default, BIP-84 (m/84'/5353'/0'/0/0)
 segwit_addr = wallet.get_address()  # or wallet.get_address("p2wpkh")
 print(f"SegWit: {segwit_addr}")  # tc1q...
 
-# Legacy P2PKH
+# Legacy P2PKH - BIP-44 (m/44'/5353'/0'/0/0)
 p2pkh_addr = wallet.get_address("p2pkh")
 print(f"P2PKH: {p2pkh_addr}")  # T...
 
-# Single-sig P2SH (P2SH-wrapped P2PKH)
+# Single-sig nested SegWit (P2SH-wrapped P2WPKH) - BIP-49 (m/49'/5353'/0'/0/0)
 p2sh_addr = wallet.get_address("p2sh")
 print(f"P2SH: {p2sh_addr}")  # M...
 ```
+
+> **Note — independent purpose fields.** `p2pkh`, `p2sh`, and `p2wpkh` are
+> each derived under their own BIP-32 purpose (44', 49', and 84'
+> respectively), from three completely separate branches of the tree.
+> `get_address("p2sh")` returns the standard **BIP-49** nested-SegWit
+> address (a P2WPKH witness program wrapped in P2SH), *not* a P2SH-wrapped
+> P2PKH script — the two look similar but are different scripts spent in
+> different ways. If you specifically need a P2SH address that wraps a
+> plain P2PKH script instead, build it explicitly with
+> `pubkey_to_p2sh_p2pkh_address()` (see
+> [Script Building Functions](#script-building-functions)).
 
 #### Custom Scripts (P2SH and P2WSH)
 
@@ -401,6 +423,98 @@ for i in range(3):
     print(f"  {i}: {addr}")
 ```
 
+### Account-Level Keys: BIP-44 / BIP-49 / BIP-84
+
+Each address type has its own, fully independent purpose field and
+therefore its own account-level xprv/xpub path:
+
+| Address type              | Standard | Account path                 |
+|---------------------------|----------|-------------------------------|
+| P2PKH (legacy)             | BIP-44   | `m/44'/5353'/account'`         |
+| P2SH-P2WPKH (nested SegWit)| BIP-49   | `m/49'/5353'/account'`         |
+| P2WPKH (native SegWit)     | BIP-84   | `m/84'/5353'/account'`         |
+
+`get_account_xprv()`/`get_account_xpub()` default to the BIP-84 path for
+backward compatibility, but accept an explicit `purpose` argument to
+reach the BIP-44 or BIP-49 branch instead. Dedicated convenience methods
+are also available so call sites don't need to remember the purpose
+numbers:
+
+```python
+wallet = Wallet.create()
+
+# Explicit purpose argument
+xpub_p2pkh  = wallet.get_account_xpub(0, purpose=44)   # m/44'/5353'/0'
+xpub_p2sh   = wallet.get_account_xpub(0, purpose=49)   # m/49'/5353'/0'
+xpub_p2wpkh = wallet.get_account_xpub(0)                # m/84'/5353'/0' (default)
+
+# Named convenience methods (equivalent to the calls above)
+xpub_p2pkh = wallet.get_account_xpub_p2pkh(0)
+xprv_p2pkh = wallet.get_account_xprv_p2pkh(0)
+
+xpub_p2sh_segwit = wallet.get_account_xpub_p2sh_segwit(0)
+xprv_p2sh_segwit = wallet.get_account_xprv_p2sh_segwit(0)
+```
+
+The same separation is available at the module level for deriving
+addresses directly from a seed, without a `Wallet` instance:
+
+```python
+from tencoinlib.keys.bip44 import derive_bip44_address_from_seed, get_account_xpub_from_seed
+from tencoinlib.keys.bip49 import derive_bip49_address_from_seed
+from tencoinlib.keys.bip84 import derive_bip84_address_from_seed
+
+seed = b"..."  # 64-byte seed
+
+_, p2pkh_addr  = derive_bip44_address_from_seed(seed, account=0, change=0, index=0)
+_, p2sh_addr   = derive_bip49_address_from_seed(seed, account=0, change=0, index=0)
+_, p2wpkh_addr = derive_bip84_address_from_seed(seed, account=0, change=0, index=0)
+
+account_xpub = get_account_xpub_from_seed(seed, account=0)  # BIP-44 account xpub
+```
+
+See [Key Management](#key-management) for the full BIP-44/BIP-49/BIP-84
+module reference.
+
+### Importing a Raw Private Key
+
+`Wallet.from_private_key()` builds a wallet from a single 32-byte
+private key — no mnemonic, no seed, and **no BIP-32 chain code**. This
+is fundamentally different from `Wallet.from_xprv()`: an xprv carries a
+chain code and can derive an entire tree of child keys, while a bare
+private key cannot derive anything beyond itself.
+
+```python
+from tencoinlib import Wallet
+
+private_key = bytes.fromhex("...")  # 32 raw bytes
+wallet = Wallet.from_private_key(private_key)
+
+print(wallet.wallet_type)          # "privkey"
+print(wallet.get_address("p2pkh")) # T... (canonical address for this type)
+```
+
+Because there is no chain code, operations that need one raise
+`WalletError` on a `"privkey"` wallet:
+
+```python
+from tencoinlib import WalletError
+
+try:
+    wallet.get_address("p2wpkh")   # no other address types can be derived
+except WalletError as e:
+    print(e)
+
+try:
+    wallet.get_master_xpub()       # no HD tree to export
+except WalletError as e:
+    print(e)
+```
+
+This wallet type also exists to support importing a single key from an
+external device — see the note at the end of
+[Wallet Storage](#wallet-storage) below.
+
 ### Wallet Storage
 
 Wallets are saved as **TCW v1** (TenCoin Wallet) encrypted binary files. Every `.tcw` file on disk is always encrypted — there is no plaintext save option.
@@ -502,7 +616,7 @@ print(wallet.is_locked)   # True
 
 ```python
 print(wallet.is_locked)    # True / False
-print(wallet.wallet_type)  # "hd" | "xpub" | "xprv"
+print(wallet.wallet_type)  # "hd" | "xpub" | "xprv" | "privkey"
 print(wallet.is_watch_only)
 ```
 
@@ -516,6 +630,27 @@ try:
 except WalletAuthError:
     print("Wrong password or corrupted file")
 ```
+
+---
+
+#### Exporting to / Importing from an External Device
+
+For advanced use cases, wallet secrets can also be moved to or from a small
+external companion device (an ESP-based hardware wallet), which uses its
+own lightweight encrypted container instead of the full `.tcw` format:
+
+```python
+# Export this wallet's secrets for the external device
+blob = wallet.export_to_esp_blob(esp_password="device-password")
+
+# Import secrets that came from the external device
+wallet = Wallet.import_from_esp_blob(blob, esp_password="device-password")
+```
+
+The password on each side may differ, and the key derivation used for the
+device format is intentionally lighter-weight to suit constrained hardware —
+use a strong, unique password when exporting to it. See `tencoinlib.wallet_storage`
+for the underlying `esp_blob_to_tcw_file` / `tcw_file_to_esp_blob` helpers.
 
 ---
 
@@ -1869,6 +2004,55 @@ difficulty = rpc.get_difficulty()
 print(difficulty)
 ```
 
+### Get Public Key (`getpublickey`)
+
+**What it does.** Give it an address (like `tc1q...` or one starting with a letter) and the node searches the whole blockchain for the **public key** of that address.
+
+**Why it is needed.** On Bitcoin-like chains an address is only the hash of a public key (a 20-byte code). The key itself is not in the address. It appears on-chain only at the moment an output of that address is **spent** (inside the `scriptSig` or the `witness`). So:
+
+- address spent at least once → the key is on-chain and can be found;
+- address never spent → the key is not on-chain; nothing can be found (ask the owner for the key).
+
+```python
+from tencoinlib.rpc import RPCClient, PublicKeyNotFoundError
+
+rpc = RPCClient(host="127.0.0.1", port=10111, token="your-token")
+
+try:
+    info = rpc.get_public_key("tc1q...")
+    print(info.public_key_hex)     # e.g. 02abc123...
+    print(info.format)             # "compressed" or "uncompressed"
+    print(info.txid, info.input_index, info.location, info.height)   # where it was revealed
+    key = info.compressed          # 33 bytes: what TMSG encryption uses
+except PublicKeyNotFoundError:
+    print("This address has never been used as a spending input.")
+```
+
+**Node command.** The client sends `{"command": "getpublickey", "params": {"address": "tc1q..."}}`.
+
+Found:
+
+```json
+{
+  "success": true,
+  "address": "tc1q...",
+  "public_key": "02abc123...",
+  "format": "compressed",
+  "source": { "txid": "...", "input_index": 0, "location": "witness", "height": 12345 },
+  "verified": true
+}
+```
+
+Not found:
+
+```json
+{ "success": false, "error": "No public key found for this address (it has never been used as a spending input)." }
+```
+
+**The answer is verified locally.** The library never trusts the node blindly: the returned key must be a valid point and must hash to the requested address (P2PKH with a compressed or uncompressed key, P2WPKH, or P2SH-P2WPKH). Otherwise `PublicKeyVerificationError` is raised and the key is not used. This matters for TMSG: a wrong key would encrypt your message to someone else.
+
+`public_key_matches_address(pubkey, address)` and `compress_public_key(pubkey)` are available from `tencoinlib.rpc`.
+
 ---
 
 ## Address Utilities
@@ -2023,6 +2207,77 @@ from tencoinlib.transaction import FeeCalculator
 builder.set_fee_rate(FeeCalculator.PRIORITY_FEE_RATE)
 ```
 
+### set_fee() — Fixed Fee with Unit
+
+Use `set_fee()` to set an exact fixed fee instead of a per-byte rate.
+The `unit` parameter controls how the value is interpreted.
+
+#### Unit: TEC
+
+Pass a float value in TEC. The builder converts it to Tenos internally (multiplied by `100_000_000`).
+
+```python
+builder.set_fee(0.0022, unit="TEC")   # → 220_000 Tenos
+builder.set_fee(0.001,  unit="TEC")   # → 100_000 Tenos
+builder.set_fee(0.0,    unit="TEC")   # → 0 Tenos (zero-fee)
+```
+
+#### Unit: Teno
+
+Pass an integer value in Tenos directly. No conversion is applied.
+
+```python
+builder.set_fee(220000, unit="Teno")  # → 220_000 Tenos
+builder.set_fee(1000,   unit="Teno")  # → 1_000 Tenos
+builder.set_fee(0,      unit="Teno")  # → 0 Tenos (zero-fee)
+```
+
+#### Unit is Case-Insensitive
+
+All of the following are equivalent:
+
+```python
+builder.set_fee(0.0022, unit="TEC")
+builder.set_fee(0.0022, unit="tec")
+builder.set_fee(0.0022, unit="Tec")
+
+builder.set_fee(220000, unit="Teno")
+builder.set_fee(220000, unit="teno")
+builder.set_fee(220000, unit="TENO")
+```
+
+---
+
+### Timelock Outputs
+
+Use `add_timelock_output()` to create outputs that cannot be spent until a certain block height or timestamp is reached.
+
+#### Lock by Block Height
+
+The output is spendable only after the blockchain reaches `lock_height`.
+
+```python
+builder.add_timelock_output(
+    address="tc1q...",
+    amount=1000000,
+    lock_height=200_000,   # Spendable after block 200,000
+)
+```
+
+#### Lock by Timestamp
+
+The output is spendable only after the given Unix timestamp.
+
+```python
+builder.add_timelock_output(
+    address="tc1q...",
+    amount=1000000,
+    lock_timestamp=1_830_297_600,   # Spendable after that Unix time
+)
+```
+
+> **Note**: Provide either `lock_height` or `lock_timestamp` — not both.
+
 ---
 
 ## Key Management
@@ -2081,6 +2336,84 @@ account_xpub = account_xprv.to_public()
 print(account_xprv.to_xprv())
 print(account_xpub.to_xpub())
 ```
+
+### BIP-44 Address Derivation
+
+```python
+from tencoinlib.keys.bip44 import (
+    derive_bip44_address_from_seed,
+    public_key_to_p2pkh,
+    get_account_xprv_from_seed,
+    get_account_xpub_from_seed,
+    bip44_account_path,
+    bip44_address_path,
+)
+
+seed = b"..."  # 64-byte seed
+
+# Derive legacy P2PKH address: m/44'/5353'/account'/change/index
+private_key, address = derive_bip44_address_from_seed(
+    seed,
+    account=0,
+    change=0,
+    index=0
+)
+
+# Convert public key to P2PKH address directly
+from tencoinlib.keys.ec import privkey_to_pubkey
+public_key = privkey_to_pubkey(private_key, compressed=True)
+address = public_key_to_p2pkh(public_key)
+
+# Account-level xprv/xpub at m/44'/5353'/account'
+account_xprv = get_account_xprv_from_seed(seed, account=0)
+account_xpub = get_account_xpub_from_seed(seed, account=0)
+
+# Path helpers
+print(bip44_account_path(0))            # "m/44'/5353'/0'"
+print(bip44_address_path(0, 0, 5))      # "m/44'/5353'/0'/0/5"
+```
+
+### BIP-49 Address Derivation
+
+```python
+from tencoinlib.keys.bip49 import (
+    derive_bip49_address_from_seed,
+    public_key_to_p2sh_segwit,
+    get_account_xprv_from_seed,
+    get_account_xpub_from_seed,
+    bip49_account_path,
+    bip49_address_path,
+)
+
+seed = b"..."  # 64-byte seed
+
+# Derive nested SegWit (P2SH-P2WPKH) address: m/49'/5353'/account'/change/index
+private_key, address = derive_bip49_address_from_seed(
+    seed,
+    account=0,
+    change=0,
+    index=0
+)
+
+# Convert public key to P2SH-P2WPKH address directly
+from tencoinlib.keys.ec import privkey_to_pubkey
+public_key = privkey_to_pubkey(private_key, compressed=True)
+address = public_key_to_p2sh_segwit(public_key)
+
+# Account-level xprv/xpub at m/49'/5353'/account'
+account_xprv = get_account_xprv_from_seed(seed, account=0)
+account_xpub = get_account_xpub_from_seed(seed, account=0)
+
+# Path helpers
+print(bip49_account_path(0))            # "m/49'/5353'/0'"
+print(bip49_address_path(0, 0, 5))      # "m/49'/5353'/0'/0/5"
+```
+
+> BIP-44, BIP-49, and BIP-84 use independent purpose fields (44', 49',
+> 84') and therefore never share a derivation branch — deriving a P2SH
+> address does not touch the same path as a P2WPKH address, and vice
+> versa. See [Account-Level Keys](#account-level-keys-bip-44--bip-49--bip-84)
+> for the equivalent `Wallet`-level API.
 
 ### BIP-84 Address Derivation
 
@@ -2322,6 +2655,451 @@ The recovery byte encodes both the parity of the public key's Y coordinate and w
 | 27–30 | Uncompressed public key (legacy compatibility) |
 
 Unlike Bitcoin (which almost exclusively produces `H` or `I` signatures due to its `0x00` address version byte), Tencoin uses version byte `0x41`, which allows all four values — `H`, `I`, `J`, `K` — to appear depending on the key. This is expected behavior and does not affect validity.
+
+---
+
+## HASHLOCK (C2) Outputs
+
+A **HASHLOCK** output (flag byte `0xC2`) locks funds behind a secret. This section covers the secrets themselves (`TCS-...`), **creating** a HASHLOCK output and **spending** one.
+
+### Overview
+
+On-chain layout of a HASHLOCK output:
+
+```
+[value 8 B][0xC2][secret_hash 32 B][varint script_len][script_pubkey]
+```
+
+- `secret_hash` is `SHA-256(preimage)` — a **single** round, not double.
+- The preimage is 1–64 bytes (`HASHLOCK_MIN_PREIMAGE` / `HASHLOCK_MAX_PREIMAGE`).
+- `script_pubkey` is an ordinary owner script (P2PKH or P2WPKH). **Spending needs both the owner's signature and the preimage** — knowing the secret alone is not enough, and owning the key alone is not enough.
+- The node checks `SHA-256(preimage) == secret_hash`. The preimage is the **last** unlocking item:
+
+| Owner script | Unlocking data |
+|---|---|
+| P2WPKH (`tc1q...`) | `witness = [signature, pubkey, preimage]` |
+| P2PKH (`T...`) | `scriptSig = <signature> <pubkey> <preimage>` |
+
+The signature is the normal BIP-143 (P2WPKH) or legacy (P2PKH) signature of the owner script with `SIGHASH_ALL`. Outputs are hashed with their own `serialize()`, so conditional outputs are committed to exactly as they appear on the wire.
+
+> **Important**: once a spending transaction is broadcast, the preimage is public (it is in the transaction). Use a fresh secret for every lock.
+
+### TCS Secrets
+
+A Tencoin secret (TCS) is the text a hash-locked payment is locked with:
+
+```
+TCS-XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXCCCCC
+prefix (4) + 55 random characters (A-Z, 0-9) + 5 checksum characters = 64 characters
+```
+
+- The random part comes from the operating system's CSPRNG.
+- The checksum is the first 5 characters (upper case) of the hex digest of `SHA-256("TCS-" + random_part)`. It only exists to catch typos.
+- The **whole 64-character text** — prefix and checksum included — is the preimage. Nothing is case-folded, re-grouped or normalised.
+- The checksum is enforced only for text that starts with the exact upper-case prefix `TCS-`. Such text with a wrong length, wrong characters or a wrong checksum is refused. Any other text (including `tcs-...` in another case, which only produces a soft warning) is a free-form manual secret and is never checked.
+- The secret text is stripped at both ends and encoded as UTF-8; the result must be 1–64 bytes.
+
+```python
+from tencoinlib import (
+    generate_secret, validate_secret, secret_to_preimage, hash_preimage,
+    soft_warnings,
+)
+
+secret = generate_secret()            # "TCS-" + 55 chars + 5-char checksum
+validate_secret(secret)               # True
+
+preimage = secret_to_preimage(secret)   # bytes — what goes on-chain when spending
+secret_hash = hash_preimage(secret)     # 32 bytes — what goes into the output when locking
+
+# Free-form secrets work too (no checksum check):
+secret_to_preimage("my secret phrase")  # b"my secret phrase"
+```
+
+> **Never log a whole secret.** Log at most its first 8 characters, or its hash.
+
+### Creating a HASHLOCK Output
+
+Use `TransactionBuilder.add_hashlock_output()`. Pass **either** `preimage` (the builder hashes it) **or** `secret_hash` (if you do not want the builder to see the secret).
+
+```python
+from tencoinlib import TransactionBuilder, generate_secret, hash_preimage
+
+secret = generate_secret()          # keep it safe — you need it to unlock the funds
+
+builder = TransactionBuilder()
+builder.add_input(txid, vout, value, script_pubkey)
+
+# `address` is the OWNER: the only key that can later claim the funds
+# (together with the secret).
+builder.add_hashlock_output(
+    address="tc1q...",
+    amount=1_000_000,
+    secret_hash=hash_preimage(secret),
+)
+builder.set_change_address("tc1q...")
+
+tx, fee = builder.build()
+```
+
+To let someone else claim the funds, lock to **their** address and give them the secret. To be spendable with this library the owner must be a P2PKH or P2WPKH address.
+
+### Spending a HASHLOCK Output
+
+#### The UTXO dictionary
+
+All spending functions take the HASHLOCK UTXO as a dictionary:
+
+| Key | Type | Description |
+|---|---|---|
+| `txid` | `str` | Funding transaction ID (64 hex chars) |
+| `vout` | `int` | Output index |
+| `value` | `int` | Value in **Tenos** |
+| `script_pubkey` | `bytes` or hex `str` | The owner script (P2PKH or P2WPKH). If missing, `address` is used instead. (`scriptPubKey` is accepted too.) |
+| `secret_hash` | `bytes` or hex `str` | The 32-byte hash committed by the output (`hashlock` is accepted too). **Required**, so the secret can be verified before signing |
+| `condition_flag` | `int` (optional) | If present, must be `0xC2` |
+
+You can build it from the funding transaction:
+
+```python
+from tencoinlib import parse_transaction
+
+funding = parse_transaction(rpc.get_raw_transaction(txid))   # raw hex of the funding tx
+out = funding.vout[0]                                         # a HashlockTxOut
+
+utxo = {
+    "txid": funding.txid(),
+    "vout": 0,
+    "value": out.value,
+    "script_pubkey": out.script_pubkey.hex(),
+    "secret_hash": out.secret_hash.hex(),
+}
+```
+
+#### One call: `wallet.spend_hashlock()`
+
+```python
+from tencoinlib import Wallet
+
+wallet = Wallet.load("my_wallet.tcw")
+
+with wallet.unlocked(password):
+    result = wallet.spend_hashlock(
+        utxo,
+        destination="tc1q...",
+        secret=tcs_secret,            # TCS-... / free-form text (str), or raw preimage (bytes)
+    )
+
+print(result.txid, result.fee)
+txid = rpc.send_raw_transaction(result.raw_transaction)
+```
+
+`spend_hashlock()` validates the UTXO, verifies the secret, builds the transaction, signs it and finalizes it. It returns a `HashlockSpendResult`:
+
+| Field | Description |
+|---|---|
+| `tx` | The signed `Transaction` object |
+| `raw_transaction` | Hex string, ready for `send_raw_transaction` |
+| `txid` | Transaction ID |
+| `fee` | Fee in Tenos (includes any sub-dust remainder) |
+| `amount` | Tenos sent to `destination` |
+| `change` | Tenos returned to `change_address` (`0` if none) |
+| `secret_hash` | Hex of the verified hash |
+
+**Amount, fee and change**
+
+```python
+# Sweep the whole UTXO (default): amount = value - fee
+wallet.spend_hashlock(utxo, "tc1q...", secret=secret)
+
+# Send part of it and return the rest as change
+wallet.spend_hashlock(
+    utxo, "tc1q...",
+    amount=1_000_000,
+    change_address="tc1q...",
+    secret=secret,
+)
+
+# Exact fee (Tenos) or a fee rate (Tenos per vbyte)
+wallet.spend_hashlock(utxo, "tc1q...", fee=2_000, secret=secret)
+wallet.spend_hashlock(utxo, "tc1q...", fee_rate=30, secret=secret)
+```
+
+- If `fee` is not given it is estimated as `max(vsize × fee_rate, MIN_RELAY_FEE)`, where the size already includes the signature, public key and preimage. The default rate is `FeeCalculator.DEFAULT_FEE_RATE`.
+- If `amount` is given and the remainder is **at least `DUST_LIMIT`**, `change_address` is required — otherwise the build is refused instead of silently burning the remainder as fee.
+- A remainder below `DUST_LIMIT` is added to the fee.
+
+**Which key signs.** The wallet signs with the key that provably owns the UTXO: it compares the HASH160 of its candidate keys with the owner script. Candidates are the canonical key, plus (seed wallets) the BIP-84 and BIP-44 keys at `account` / `change` / `index`. For addresses other than the first one pass the position they were derived from:
+
+```python
+wallet.spend_hashlock(utxo, "tc1q...", secret=secret, account=0, change=0, index=3)
+```
+
+If no key of the wallet owns the UTXO, `HashlockSpendSigningError` is raised and nothing is signed. Watch-only wallets cannot sign (`WalletError`), and locked wallets raise `WalletLockedError`.
+
+#### Step by step
+
+```python
+from tencoinlib import (
+    build_hashlock_spend, finalize_hashlock_spend, verify_hashlock_secret,
+)
+
+# 1. (optional) check the secret first:
+#    False  -> wrong secret
+#    raises InvalidHashlockSecretError -> typo / bad TCS checksum / empty / too long
+assert verify_hashlock_secret(tcs_secret, utxo["secret_hash"])
+
+# 2. build the unsigned transaction
+tx = build_hashlock_spend(utxo, "tc1q...", secret=tcs_secret)
+
+# 3. sign input 0 and place the preimage in the unlocking data
+with wallet.unlocked(password):
+    wallet.sign_hashlock_spend(tx, 0, utxo, tcs_secret)
+
+# 4. final checks + raw hex
+raw_tx = finalize_hashlock_spend(tx)
+rpc.send_raw_transaction(raw_tx)
+```
+
+- `build_hashlock_spend(...)` takes the same `amount`, `fee`, `fee_rate` and `change_address` options as above. `secret` is optional there; if given it is verified against the UTXO and its real size is used for the fee estimate (otherwise 64 bytes are assumed).
+- `sign_hashlock_spend()` needs the `utxo` as well as the transaction, because the signature commits to the UTXO's value and owner script and because the secret is checked against its `secret_hash` first. It modifies `tx` in place and also returns it.
+- `finalize_hashlock_spend()` refuses transactions with an unsigned input, serializes with the library's own `Transaction.serialize()` and re-parses the result to make sure it round-trips.
+
+#### Without a Wallet
+
+If you hold the private key yourself:
+
+```python
+from tencoinlib import spend_hashlock
+
+result = spend_hashlock(
+    utxo,
+    private_key,                # 32 bytes
+    "tc1q...",
+    secret=tcs_secret,
+)
+```
+
+`sign_hashlock_input(tx, input_index, utxo, private_key, secret)` is the matching low-level signer. It checks that the key owns the UTXO and that input `input_index` really spends this UTXO's outpoint.
+
+#### Transactions with Several Inputs
+
+Each hashlock input is signed separately with `sign_hashlock_input()` / `wallet.sign_hashlock_spend()`. Sign the **ordinary** inputs first: `TransactionSigner.sign_transaction()` returns a copy of the transaction that does not keep witnesses already present on other inputs.
+
+```python
+from tencoinlib import TransactionBuilder, SegWitSigner, finalize_hashlock_spend
+
+builder = TransactionBuilder()
+builder.add_input(plain_txid, 0, plain_value, plain_script)                    # ordinary P2WPKH input (index 0)
+builder.add_input(utxo["txid"], utxo["vout"], utxo["value"],
+                  bytes.fromhex(utxo["script_pubkey"]))                        # HASHLOCK input (index 1)
+builder.add_output("tc1q...", amount)
+builder.set_fee(fee)
+tx, _ = builder.build()
+
+SegWitSigner.sign_p2wpkh_input(tx, 0, {"value": plain_value}, plain_key)        # ordinary input first
+wallet.sign_hashlock_spend(tx, 1, utxo, tcs_secret)                            # then the HASHLOCK input
+raw_tx = finalize_hashlock_spend(tx)
+```
+
+#### Limitations
+
+- Only **C2** (HASHLOCK) outputs are supported. C3 (timelock + hashlock) and C4 (hashlock + expiry + refund) outputs are not.
+- The owner script must be **P2PKH or P2WPKH**. P2SH and P2WSH owners are refused with `InvalidHashlockUTXOError`.
+- The library cannot validate the transaction against the node's consensus rules. Before sending a real amount, check it with `rpc.test_mempool_accept(raw_tx)` or try a small amount first.
+
+---
+
+## TMSG (Tencoin Message)
+
+**TMSG** encrypts messages, files and whole folders to one or many public keys, so that only the holders of the matching private keys can read them. It works **off-chain** (a payload you store or send yourself) and **on-chain** (the payload sits in an `OP_RETURN` output of a normal transaction, next to a payment to the recipient).
+
+```python
+from tencoinlib import tmsg
+```
+
+### Overview
+
+| Version | Recipient keys | Who can decrypt | Overhead added to the plaintext |
+|---|---|---|---|
+| `0x01` | exactly 1 | the owner of that key | 66 bytes |
+| `0x02` | 2 – 255 | **any one** of the owners | 34 + 93 × N bytes |
+
+The version is chosen automatically: one key gives version 1, two or more give version 2.
+
+- **Crypto**: ECDH on secp256k1 with a fresh ephemeral key, then AES-256-GCM. The AES key is `SHA-256(compressed ephemeral_priv × recipient_pub)`. Version 2 encrypts the data once with a random content key and wraps that key for every recipient.
+- **Payload layout**: `"TMSG"` · version · (v2: N, then N × 93-byte recipient blocks) · ephemeral key (v1) · nonce · ciphertext + 16-byte tag. It is byte-for-byte compatible with the reference `enc_file.py` / `dec_file.py` tools.
+- **Authenticity**: TMSG proves that nothing was modified, not who wrote it. Anyone who knows your public key can encrypt to you. If the sender must be provable, sign the plaintext too (see [Message Signing](#message-signing)).
+- **Recipients are visible**: the number of recipients and their ephemeral keys can be seen in a v2 payload (not who they are).
+- Keys can be given as bytes (33 or 65), hex (a `0x` prefix is accepted), several keys in one string (separated by space, comma or semicolon), or an **address** (see below; needs `rpc=`). Duplicates are dropped.
+
+### Getting a recipient's public key
+
+An address is only a hash of a key, so you need the key itself. Three ways:
+
+1. **They give it to you.** With a wallet: `wallet.tmsg_public_key("p2wpkh")` (hex, 66 chars) for the `tc1q...` address, or `"p2pkh"` for the `T...` address.
+2. **Look it up on-chain with `getpublickey`.** `rpc.get_public_key(address)` finds the key the address revealed when it spent an output. It only works for addresses that have **already spent** (see [Get Public Key](#get-public-key-getpublickey)).
+3. **Pass the address directly**: `tmsg.encrypt(data, "tc1q...", rpc=rpc)` runs the lookup for you.
+
+### Off-chain: messages
+
+```python
+from tencoinlib import tmsg
+
+recipient = "02ab...66 hex chars..."                  # or a list of keys
+
+# Text -> payload (bytes, or hex with as_hex=True)
+payload = tmsg.encrypt_text("Hello Alice", recipient)
+hex_payload = tmsg.encrypt_text("Hello Alice", recipient, as_hex=True)
+
+# Payload (bytes or hex) -> text
+text = tmsg.decrypt_text(hex_payload, private_key)    # 32 bytes or 64 hex chars
+
+# Raw bytes
+payload = tmsg.encrypt(b"\x00\x01 binary", [pub_alice, pub_bob])    # v2: Alice OR Bob can open it
+data = tmsg.decrypt(payload, bob_private_key)
+
+# Look inside without a key
+info = tmsg.inspect(payload)
+print(info.version, info.recipients, info.plaintext_size, info.overhead)
+```
+
+`decrypt()` also accepts a list of private keys and tries them in order.
+
+### Off-chain: files and folders
+
+```python
+# One file:   report.pdf  ->  report.pdf.enc
+res = tmsg.encrypt_file("report.pdf", [pub_alice, pub_bob])
+print(res.path, res.version, res.recipients)
+tmsg.decrypt_file("report.pdf.enc", private_key)           # -> report.pdf
+
+# A folder, as ONE encrypted archive (names and structure hidden): docs/ -> docs.zip.enc
+tmsg.encrypt_folder("docs", pub_alice)
+tmsg.decrypt_folder("docs.zip.enc", private_key)           # extracts into docs_dec/
+
+# A folder, file by file (names visible): docs/ -> docs_enc/  with .enc on every file
+tmsg.encrypt_folder("docs", pub_alice, mode="files")
+tmsg.decrypt_folder("docs_enc", private_key)               # -> docs_enc_dec/
+
+# An existing .zip is accepted as input too
+tmsg.encrypt_folder("pack.zip", pub_alice)
+```
+
+| Behaviour | Details |
+|---|---|
+| Existing files | Never overwritten: a numbered name (`name_1.ext`) is used, or pass `overwrite=True`. With an explicit `output=` an existing file raises `FileExistsError`. |
+| Writes | Atomic (temp file, then rename); a failed decryption writes nothing. |
+| Size | Each file is processed in memory as one AEAD message: limit `max_size` (default 1 GiB). |
+| Results | `FileResult` (`path`, `input_size`, `output_size`, `version`, `recipients`) and `FolderResult` (`output`, `files`, `errors`, `skipped`, `ok`). |
+| Symlinks | Skipped when encrypting a folder (listed in `result.skipped`). |
+| Errors per file | In `"files"` mode a failing file does not stop the others; check `result.errors`. |
+
+**Hostile archives.** Anyone can encrypt to your public key, so decrypting a folder never trusts the archive: entries with absolute paths, `..`, drive letters, links or special files are skipped (and listed in `result.skipped`), and the amount written is bounded by `max_extract_size` (default 4 GiB) and `max_files` (default 100 000) — raising `TMSGSizeError` when exceeded.
+
+### On-chain messages
+
+An on-chain TMSG is a normal transaction with this layout:
+
+| Output | Content |
+|---|---|
+| 0 | **At least 1 Teno** to the recipient address. The dust limit does **not** apply to transactions that carry a TMSG. |
+| 1 | `OP_RETURN` holding the encrypted payload (up to 1024 data bytes) |
+| 2 | Change back to the sender (only if something is left) |
+
+**Capacity.** An `OP_RETURN` carries 1024 bytes, so a message can be up to **958 bytes** for one recipient (1024 − 66). With N recipients the maximum is `1024 − (34 + 93 × N)`:
+
+| Recipients | 1 (v1) | 2 | 3 | 5 | 10 |
+|---|---|---|---|---|---|
+| Max message size | 958 | 804 | 711 | 525 | 60 |
+
+Use `tmsg.max_plaintext(recipients)` to get the number.
+
+#### With a wallet (simplest)
+
+```python
+from tencoinlib import Wallet
+from tencoinlib.rpc import RPCClient
+
+rpc = RPCClient(host="127.0.0.1", port=10111, token="your-token")
+wallet = Wallet.load("my_wallet.tcw")
+
+with wallet.unlocked(password):
+    tx = wallet.send_tmsg(
+        rpc,
+        to_address="tc1q...",          # gets 1 Teno (raise it with amount=...)
+        message="Meeting at 10:00",
+        # recipients=None  -> the recipient's key is looked up on-chain with getpublickey
+        # recipients="02ab..." or ["02ab...", "03cd..."] -> explicit keys (v2 for several)
+        include_self=True,             # optional: you can read your own message later
+    )
+
+print(tx.txid, tx.fee, tx.version)
+rpc.send_raw_transaction(tx.raw_transaction)      # or pass broadcast=True above
+```
+
+`send_tmsg()` takes the UTXOs of the wallet's addresses from `rpc` (or from `utxos=[...]`), spends the fewest and largest ones that cover the cost, sends the change to `change_address` (default: the wallet's P2PKH address), signs, and returns a signed `TMSGTransaction`. It never broadcasts unless you pass `broadcast=True`. For keys beyond index 0 pass `account`, `change`, `index`.
+
+#### Step by step (no wallet)
+
+```python
+from tencoinlib import tmsg
+
+utxos = rpc.list_unspent(sender_address)          # dicts with txid, vout, amount, scriptPubKey
+
+tx = tmsg.build_tmsg_transaction(
+    utxos,
+    "tc1q...recipient",
+    "Meeting at 10:00",
+    recipients="02ab...",                         # or None + rpc=rpc to look it up
+    amount=1,                                     # Tenos for the recipient (default and minimum 1)
+    change_address=sender_address,                # required if more than dust would be left over
+    fee_rate=None,                                # Tenos per vbyte; or fee=... for an exact fee
+    rpc=rpc,
+)
+
+tx.sign([sender_private_key])                     # a pool: every input uses the key that matches it
+rpc.test_mempool_accept(tx.raw_transaction)       # optional dry run
+txid = rpc.send_raw_transaction(tx.raw_transaction)
+```
+
+`TMSGTransaction` fields: `tx` (the `Transaction`), `payload`, `recipients`, `version`, `fee`, `amount`, `change`, `plaintext_size`, `padding`, `signed`, `txid`, and `raw_transaction` (only after `sign()`). Inputs must be P2WPKH or P2PKH outputs.
+
+**Fees.** The estimate is `max(vsize × fee_rate, MIN_RELAY_FEE)` and already includes the signatures and the OP_RETURN (default rate: `FeeCalculator.DEFAULT_FEE_RATE`). If your node demands more for data-carrying transactions, pass `fee_rate=` or an exact `fee=`, and check with `rpc.test_mempool_accept()` first.
+
+**Change.** If at least `DUST_LIMIT` would be left over and no `change_address` is given, the build is refused instead of burning the rest as fee. A remainder below the dust limit goes to the miner.
+
+**Unsafe message sizes.** A script length of 193–207 bytes is indistinguishable from a conditional-output flag byte (`0xC1`–`0xCF`) when an output is parsed, so such an `OP_RETURN` must never be produced. For one recipient this affects text messages of **124–138 bytes**. By default `build_tmsg_transaction()` raises `TMSGSizeError` (with `.pad_bytes`, the number of bytes to add). For text messages you can pass `size_policy="pad"` to append the needed spaces (at most 15):
+
+```python
+tx = tmsg.build_tmsg_transaction(utxos, to, text, recipients=pub, change_address=addr,
+                                 size_policy="pad")
+print(tx.padding)        # spaces that were appended
+```
+
+`TransactionBuilder.op_return()` applies the same check to every `OP_RETURN` output.
+
+#### Reading an on-chain message
+
+```python
+# By txid (needs rpc), raw hex, or a Transaction object
+for msg in tmsg.decrypt_transaction("67d70f82...", private_key, rpc=rpc):
+    print(msg.output_index, msg.text)         # msg.plaintext for raw bytes
+
+# Only look for TMSG payloads (no key needed)
+for item in tmsg.extract_tmsg_payloads(raw_hex):
+    print(item.output_index, tmsg.inspect(item.payload))
+
+# With a wallet: tries the canonical, BIP-84 and BIP-44 keys
+with wallet.unlocked(password):
+    messages = wallet.decrypt_tmsg_transaction(txid, rpc=rpc)
+    data = wallet.decrypt_tmsg(payload_hex)                    # a bare payload
+```
+
+An output counts as a TMSG when its script is `OP_RETURN <one push>` and the data starts with `TMSG`. `decrypt_transaction()` raises `TMSGFormatError` if the transaction carries none, and `TMSGDecryptionError` if it carries some but none of your keys opens them.
+
+### TMSG and the OP_RETURN limit
+
+`TransactionBuilder.op_return()` now accepts up to **1024** bytes (it was 80) and encodes large payloads with `OP_PUSHDATA2`, exactly as the node expects. Use `add_tmsg_output(address, payload, amount=1)` to add the first two outputs of a TMSG transaction by hand.
 
 ---
 
@@ -2568,6 +3346,13 @@ print(f"\nNext Receiving Address: {next_addr}")
 - Create a wallet from a master/account xprv
 - Full private derivation is available, but no mnemonic/seed is required
 
+**`Wallet.from_private_key(private_key: Union[bytes, str]) -> Wallet`**
+- Create a wallet from a single raw 32-byte private key (bytes, or a 64-char hex string) — no mnemonic, no seed, and no BIP-32 chain code
+- Canonical address is legacy P2PKH; distinct from `from_xprv()`, which carries a chain code and can derive a full tree
+- **Returns**: `Wallet` instance (UNLOCKED), `wallet_type == "privkey"`
+- **Raises**: `WalletError` if the key is not exactly 32 bytes
+- Operations requiring a chain code (`get_master_xprv`/`xpub`, `derive_xprv`/`xpub`, `get_account_xprv`/`xpub`, `get_address("p2wpkh")`/`get_address("p2sh")`) raise `WalletError` on this wallet type
+
 **`Wallet.load(filepath: str) -> Wallet`**
 - Read a `.tcw` file header without decrypting — returns a LOCKED wallet
 - **Parameters**: `filepath` - Path to a `.tcw` file
@@ -2613,9 +3398,10 @@ print(f"\nNext Receiving Address: {next_addr}")
 - Get address for the current key in the requested form
 - `p2wpkh` is available while LOCKED; `p2pkh` and `p2sh` require UNLOCKED
 - **Parameters**:
-  - `type`: One of `"p2wpkh"` (default), `"p2pkh"`, `"p2sh"`, `"p2wsh"`
+  - `type`: One of `"p2wpkh"` (default, BIP-84), `"p2pkh"` (BIP-44), `"p2sh"` (BIP-49 nested SegWit / P2SH-P2WPKH), `"p2wsh"`
   - `script`: For `"p2sh"` (optional) or `"p2wsh"` (required)
 - **Returns**: Address string (`tc1q...`, `T...`, or `M...`)
+- **Raises**: `WalletError` for any type other than `"p2pkh"` on a `"privkey"`-type wallet (no chain code to derive from)
 
 **`get_private_key_hex() -> str`**
 - Get private key as hex string (UNLOCKED required)
@@ -2641,11 +3427,21 @@ print(f"\nNext Receiving Address: {next_addr}")
 - Derive extended public key at a BIP-32 path
 - Full wallets support hardened + non-hardened; watch-only: non-hardened only
 
-**`get_account_xprv(account: int) -> str`**
-- Get account-level xprv at `m/84'/5353'/account'` (UNLOCKED required)
+**`get_account_xprv(account: int, purpose: int = 84) -> str`**
+- Get account-level xprv at `m/{purpose}'/5353'/account'` (UNLOCKED required)
+- `purpose` defaults to 84 (native SegWit) for backward compatibility; pass `44` or `49` explicitly for the legacy P2PKH or nested-SegWit branch
 
-**`get_account_xpub(account: int) -> str`**
-- Get account-level xpub at `m/84'/5353'/account'`
+**`get_account_xpub(account: int, purpose: int = 84) -> str`**
+- Get account-level xpub at `m/{purpose}'/5353'/account'`
+- Same `purpose` default/override behavior as `get_account_xprv`
+
+**`get_account_xprv_p2pkh(account: int = 0) -> str`**  
+**`get_account_xpub_p2pkh(account: int = 0) -> str`**
+- BIP-44 account-level xprv/xpub at `m/44'/5353'/account'`
+
+**`get_account_xprv_p2sh_segwit(account: int = 0) -> str`**  
+**`get_account_xpub_p2sh_segwit(account: int = 0) -> str`**
+- BIP-49 account-level xprv/xpub at `m/49'/5353'/account'`
 
 **`derive_address(account: int = 0, change: int = 0, index: int = 0) -> Tuple[str, str]`**
 - Derive BIP-84 address at a specific path (UNLOCKED required)
@@ -2665,7 +3461,66 @@ print(f"\nNext Receiving Address: {next_addr}")
 - BIP-32 import/export helpers; xprv operations require UNLOCKED
 
 **`wallet_type -> str`** *(property)*
-- One of `"hd"`, `"xpub"`, `"xprv"`
+- One of `"hd"`, `"xpub"`, `"xprv"`, `"privkey"`
+
+#### HASHLOCK Spending
+
+**`sign_hashlock_spend(tx: Transaction, input_index: int, utxo: dict, secret: Union[str, bytes], *, account: int = 0, change: int = 0, index: int = 0) -> Transaction`**
+- Sign input `input_index` of `tx` as a HASHLOCK (C2) spend (UNLOCKED required)
+- Verifies the secret against the UTXO's `secret_hash`, finds the wallet key that owns the UTXO, signs, and places `[sig, pubkey, preimage]` in the witness (P2WPKH owner) or `<sig> <pubkey> <preimage>` in the scriptSig (P2PKH owner)
+- **Parameters**:
+  - `tx` — unsigned transaction (e.g. from `build_hashlock_spend()`); modified in place
+  - `input_index` — the input that spends the HASHLOCK UTXO
+  - `utxo` — dict with `txid`, `vout`, `value`, `script_pubkey`, `secret_hash`
+  - `secret` — TCS / free-form text (`str`) or raw preimage (`bytes`)
+  - `account`, `change`, `index` — HD position of the owning key (seed wallets)
+- **Returns**: The same `Transaction`
+- **Raises**: `WalletLockedError`, `WalletError` (watch-only), `InvalidHashlockUTXOError`, `InvalidHashlockSecretError`, `HashlockSpendSigningError` (no wallet key owns the UTXO, outpoint mismatch)
+
+**`spend_hashlock(utxo: dict, destination: str, amount: int = None, fee: int = None, secret: Union[str, bytes] = None, *, fee_rate: int = None, change_address: str = None, account: int = 0, change: int = 0, index: int = 0) -> HashlockSpendResult`**
+- Spend a HASHLOCK UTXO end to end (UNLOCKED required): validate → verify secret → build → sign → finalize
+- **Parameters**: `amount=None` sweeps the whole UTXO; `fee=None` estimates the fee from `fee_rate`; `change_address` is required when `amount` leaves at least `DUST_LIMIT` behind; `secret` is required
+- **Returns**: `HashlockSpendResult` (`tx`, `raw_transaction`, `txid`, `fee`, `amount`, `change`, `secret_hash`)
+- **Raises**: same as `sign_hashlock_spend()`, plus `HashlockSpendBuildError`
+
+#### TMSG
+
+**`tmsg_public_key(address_type: str = "p2wpkh", account: int = 0, change: int = 0, index: int = 0) -> str`**
+- Compressed public key (66 hex chars) that others encrypt TMSG messages to (UNLOCKED required)
+- `"p2wpkh"` is the key of the `tc1q...` address (BIP-84, seed wallets only), `"p2pkh"` the key of the `T...` address (BIP-44, or the raw key of a private-key wallet)
+
+**`send_tmsg(rpc, to_address: str, message: Union[str, bytes], recipients=None, *, amount: int = 1, fee: int = None, fee_rate: int = None, change_address: str = None, include_self: bool = False, size_policy: str = "error", utxos: List[dict] = None, broadcast: bool = False, account: int = 0, change: int = 0, index: int = 0) -> TMSGTransaction`**
+- Send an encrypted on-chain message (UNLOCKED required): output 0 pays `amount` Tenos to `to_address`, output 1 is the `OP_RETURN` with the TMSG, output 2 the change
+- **Parameters**:
+  - `recipients` — public key(s) allowed to decrypt; `None` looks up the key of `to_address` with `rpc.get_public_key()`
+  - `include_self` — also encrypt to this wallet (makes it a v2 message)
+  - `change_address` — default: the wallet's P2PKH address
+  - `utxos` — use these instead of asking `rpc` (dicts with `txid`, `vout`, `amount`, `scriptPubKey`)
+  - `size_policy` — `"error"` or `"pad"` (see [On-chain messages](#on-chain-messages))
+  - `broadcast` — also send it with `rpc.send_raw_transaction` (`tx.broadcast_txid` is then set)
+- **Returns**: signed `TMSGTransaction`
+- **Raises**: `WalletLockedError`, `WalletError` (watch-only, no UTXOs), `TMSGError`, `TMSGSizeError`, `TMSGKeyError`, `PublicKeyNotFoundError`
+
+**`decrypt_tmsg(payload: Union[bytes, str], *, account: int = 0, change: int = 0, index: int = 0) -> bytes`**
+- Decrypt a bare TMSG payload (bytes or hex) with the wallet's keys (canonical, BIP-84 and BIP-44 at `account`/`change`/`index`)
+- **Raises**: `TMSGDecryptionError`, `TMSGFormatError`
+
+**`decrypt_tmsg_transaction(source, *, rpc=None, account: int = 0, change: int = 0, index: int = 0) -> List[DecryptedMessage]`**
+- Decrypt the TMSG(s) in a transaction (`Transaction`, raw hex, or txid with `rpc`)
+
+#### ESP32 Bridge
+
+**`export_to_esp_blob(esp_password: str, iterations: int = 10000, totp: List[str] = None, totp_mask: int = None, passphrase_used: bool = None) -> bytes`**
+- Encrypt this wallet's secrets as a TCE1 blob for an ESP32 device (UNLOCKED required)
+- Only `"hd"` and `"privkey"` wallets can be exported
+- **Raises**: `WalletLockedError`, `ESPBridgeError` (no ESP equivalent for `"xprv"`/`"xpub"`), `TCEFormatError` (iterations out of range)
+
+**`Wallet.import_from_esp_blob(blob: bytes, esp_password: str) -> Wallet`**
+- Decrypt a TCE1 blob and build an UNLOCKED wallet directly from it
+- **Returns**: `Wallet` instance, `wallet_type` `"hd"` or `"privkey"`
+- **Raises**: `TCEAuthError` (wrong password/corrupted), `TCEFormatError`, `ESPBridgeError` (inconsistent payload)
+
+A TCE1 blob saved to disk uses the **`.tce`** extension (paralleling `.tcw`). `wallet_storage.tce.save_esp_blob(filepath, blob)` / `load_esp_blob(filepath)` read/write it, with the same extension auto-resolution as `Wallet.load()`. `esp_blob_to_tcw_file()` accepts either raw bytes or a `.tce` path directly; `tcw_file_to_esp_blob()` takes an optional `out_path` to also save a `.tce` copy.
 
 ### TransactionBuilder Class
 
@@ -2688,6 +3543,49 @@ print(f"\nNext Receiving Address: {next_addr}")
 **`set_fee_rate(fee_rate: int) -> TransactionBuilder`**
 - Set custom fee rate (Tenos per byte)
 - **Returns**: Self for method chaining
+
+**`set_fee(amount: float | int, unit: str = "Teno") -> TransactionBuilder`**
+- Set a fixed fee amount (overrides fee rate)
+- **Parameters**:
+  - `amount` — Fee value; float for TEC, int for Teno
+  - `unit` — `"TEC"` (converts × 100_000_000) or `"Teno"` (no conversion); case-insensitive
+- **Returns**: Self for method chaining
+- **Raises**: `TransactionBuilderError` if unit is unrecognized
+
+**`add_timelock_output(address: str, amount: int, lock_height: int = None, lock_timestamp: int = None) -> TransactionBuilder`**
+- Add an output that is unspendable until a block height or Unix timestamp is reached
+- **Parameters**:
+  - `address` — Recipient address (any supported type)
+  - `amount` — Amount in Tenos
+  - `lock_height` — Absolute block height after which the output is spendable
+  - `lock_timestamp` — Unix timestamp after which the output is spendable
+- Provide exactly one of `lock_height` or `lock_timestamp`
+- **Returns**: Self for method chaining
+- **Raises**: `TransactionBuilderError` if both or neither lock parameters are given, or if amount is below dust limit
+
+**`add_hashlock_output(address: str, amount: int, preimage: bytes = None, secret_hash: bytes = None) -> TransactionBuilder`**
+- Add a HASHLOCK (`0xC2`) output; spending it needs the owner's signature and the preimage (see [HASHLOCK (C2) Outputs](#hashlock-c2-outputs))
+- **Parameters**:
+  - `address` — Owner address (any valid type; P2PKH/P2WPKH to be spendable with this library)
+  - `amount` — Amount in Tenos (at least `DUST_LIMIT`)
+  - `preimage` — Raw secret bytes, 1–64 bytes; the builder computes `SHA-256(preimage)`
+  - `secret_hash` — Precomputed 32-byte `SHA-256(preimage)`
+- Provide exactly one of `preimage` or `secret_hash`
+- **Returns**: Self for method chaining
+- **Raises**: `TransactionBuilderError` if both or neither are given, the preimage/hash has the wrong size, the amount is below dust, or the address is invalid
+
+**`op_return(data: Union[str, bytes]) -> TransactionBuilder`**
+- Add an `OP_RETURN` output (value 0). Strings are UTF-8 encoded
+- Maximum **1024** bytes (`OP_RETURN_MAX_DATA`); payloads over 75 bytes use `OP_PUSHDATA1` / `OP_PUSHDATA2`
+- A payload of 190–204 bytes is refused: its 193–207 byte script is indistinguishable from a conditional-output flag byte (`0xC1`–`0xCF`)
+- **Raises**: `TransactionBuilderError`
+
+**`add_tmsg_output(address: str, payload: bytes, amount: int = 1) -> TransactionBuilder`**
+- Add the first two outputs of an on-chain TMSG transaction: `amount` Tenos to `address` (output 0) and an `OP_RETURN` with the TMSG payload (output 1). The change output, if any, becomes output 2
+- The dust limit does **not** apply: `amount` may be as low as 1 Teno (`TMSG_MIN_PAYMENT`)
+- Must be called on a builder without outputs
+- **Parameters**: `payload` — complete TMSG payload (starts with `b"TMSG"`), e.g. from `tmsg.encrypt()`
+- **Raises**: `TransactionBuilderError` for an invalid address, a payload that is not a TMSG, an amount below 1, outputs already present, or an unsafe/oversized payload
 
 **`set_segwit(use_segwit: bool) -> TransactionBuilder`**
 - Set whether to use SegWit inputs
@@ -2891,6 +3789,7 @@ SegWit transaction signer (BIP-143) for P2WPKH addresses.
 - `validate_address(address: str) -> Dict`
 - `estimate_fee(blocks: int = 6) -> Dict`
 - `get_difficulty() -> Dict`
+- `get_public_key(address: str) -> PublicKeyInfo` — node command `getpublickey`: the public key an address revealed on-chain, verified against the address. Raises `PublicKeyNotFoundError` if the address never spent, `PublicKeyVerificationError` if the node's key does not match the address
 
 ### Script Building Functions
 
@@ -2941,7 +3840,24 @@ SegWit transaction signer (BIP-143) for P2WPKH addresses.
 #### pubkey_to_p2sh_p2pkh_address
 
 **`pubkey_to_p2sh_p2pkh_address(pubkey: bytes, version: int = P2SH_VERSION) -> str`**
-- Build P2SH address that pays to P2PKH redeem script (single-sig P2SH, M...)
+- Build P2SH address that pays to a plain P2PKH redeem script (single-sig P2SH, M...)
+- Not the address type `wallet.get_address("p2sh")` returns — see `pubkey_to_p2sh_p2wpkh_address` below
+- **Parameters**:
+  - `pubkey` - 33-byte compressed public key
+  - `version` - P2SH version byte (default mainnet 0x32)
+- **Returns**: Base58Check P2SH address
+
+#### build_p2wpkh_redeem_script
+
+**`build_p2wpkh_redeem_script(pubkey: bytes) -> bytes`**
+- Build the BIP-49 witness-v0 redeem script used to nest a P2WPKH output inside P2SH: `OP_0 <20-byte-hash160(pubkey)>`
+- **Parameters**: `pubkey` - 33-byte compressed public key
+- **Returns**: 22-byte redeem script
+
+#### pubkey_to_p2sh_p2wpkh_address
+
+**`pubkey_to_p2sh_p2wpkh_address(pubkey: bytes, version: int = P2SH_VERSION) -> str`**
+- Build a standard BIP-49 nested SegWit address (single-sig P2SH-P2WPKH, M...) — this is what `wallet.get_address("p2sh")` returns
 - **Parameters**:
   - `pubkey` - 33-byte compressed public key
   - `version` - P2SH version byte (default mainnet 0x32)
@@ -2997,6 +3913,179 @@ SegWit transaction signer (BIP-143) for P2WPKH addresses.
 **`class MessageSigningError(Exception)`**
 - Raised for all message signing and verification errors, including missing dependencies, malformed input, and cryptographic failures.
 
+### Hashlock Module
+
+```python
+from tencoinlib import (
+    prepare_hashlock_secret, verify_hashlock_secret, build_hashlock_spend,
+    sign_hashlock_input, finalize_hashlock_spend, spend_hashlock,
+)
+from tencoinlib.transaction.hashlock import normalize_hashlock_utxo, PreparedHashlockSecret
+```
+
+#### prepare_hashlock_secret
+
+**`prepare_hashlock_secret(secret: Union[str, bytes]) -> PreparedHashlockSecret`**
+- Validate a secret and turn it into the on-chain preimage
+- `str` is handled exactly like Tencoin Core (stripped, UTF-8, `TCS-` checksum verified); `bytes` is used unchanged (1–64 bytes)
+- **Returns**: `PreparedHashlockSecret` with `.preimage` (bytes), `.hash` (32 bytes) and `.hash_hex`
+- **Raises**: `InvalidHashlockSecretError`
+
+#### verify_hashlock_secret
+
+**`verify_hashlock_secret(secret: Union[str, bytes], expected_hash: Union[str, bytes]) -> bool`**
+- `True` if `SHA-256(preimage)` equals `expected_hash` (bytes or hex); constant-time comparison
+- **Returns**: `False` for a wrong secret
+- **Raises**: `InvalidHashlockSecretError` for a malformed secret (bad TCS checksum, empty, too long); `InvalidHashlockUTXOError` for a malformed `expected_hash`
+
+#### normalize_hashlock_utxo
+
+**`normalize_hashlock_utxo(utxo: dict) -> HashlockUTXO`**
+- Validate a C2 UTXO dict and return it in canonical form (`txid`, `vout`, `value`, `script_pubkey`, `secret_hash`, `owner_type` = `"p2wpkh"` or `"p2pkh"`, `owner_hash`)
+- **Raises**: `InvalidHashlockUTXOError` (wrong `condition_flag`, bad fields, missing `secret_hash`, unsupported owner script)
+
+#### build_hashlock_spend
+
+**`build_hashlock_spend(utxo: dict, destination: str, amount: int = None, fee: int = None, secret: Union[str, bytes] = None, *, fee_rate: int = None, change_address: str = None) -> Transaction`**
+- Build the **unsigned** transaction spending one HASHLOCK UTXO, using `TransactionBuilder`
+- **Parameters**:
+  - `amount` — Tenos to send; `None` sweeps the UTXO (value − fee)
+  - `fee` — Exact fee in Tenos; `None` estimates it from `fee_rate` (default `FeeCalculator.DEFAULT_FEE_RATE` per vbyte, never below `MIN_RELAY_FEE`)
+  - `secret` — Optional; if given it is verified against the UTXO, and its real size is used for the estimate (otherwise 64 bytes)
+  - `change_address` — Required when `amount` leaves at least `DUST_LIMIT`; a smaller remainder is added to the fee
+- **Raises**: `InvalidHashlockUTXOError`, `InvalidHashlockSecretError`, `HashlockSpendBuildError` (bad address, dust amount, fee ≥ value, insufficient funds, remainder that would be burned)
+
+#### sign_hashlock_input
+
+**`sign_hashlock_input(tx: Transaction, input_index: int, utxo: dict, private_key: bytes, secret: Union[str, bytes]) -> Transaction`**
+- Sign input `input_index` in place and reveal the preimage (last item of the witness / scriptSig)
+- Checks that the input spends the UTXO's outpoint, that the secret matches `secret_hash`, and that `private_key` owns the owner script
+- **Raises**: `InvalidHashlockUTXOError`, `InvalidHashlockSecretError`, `HashlockSpendSigningError`
+
+#### finalize_hashlock_spend
+
+**`finalize_hashlock_spend(tx: Transaction) -> str`**
+- Check that every input is signed, serialize the transaction and verify that it re-parses to the same txid
+- **Returns**: Raw transaction hex
+- **Raises**: `HashlockSpendSigningError` (unsigned input), `HashlockError` (empty transaction, negative output, serialization mismatch)
+
+#### spend_hashlock
+
+**`spend_hashlock(utxo: dict, private_key: bytes, destination: str, amount: int = None, fee: int = None, secret: Union[str, bytes] = None, *, fee_rate: int = None, change_address: str = None) -> HashlockSpendResult`**
+- Build, sign (with an explicit key) and finalize in one call; `secret` is required
+- **Returns**: `HashlockSpendResult` (`tx`, `raw_transaction`, `txid`, `fee`, `amount`, `change`, `secret_hash`)
+
+### Secret Module
+
+```python
+from tencoinlib import (
+    generate_secret, validate_secret, is_valid_tencoin_secret, check_secret,
+    parse_secret, secret_to_preimage, hash_preimage, soft_warnings,
+    SecretError, SecretFormatError,
+)
+```
+
+**`generate_secret() -> str`**
+- A new random 64-character `TCS-...` secret (CSPRNG), checksum included
+
+**`validate_secret(secret: str) -> bool`** / **`is_valid_tencoin_secret(text: str) -> bool`**
+- `True` only for a well-formed `TCS-` secret with a correct checksum; never raises (free-form text returns `False`)
+
+**`check_secret(text: str) -> None`**
+- Raises `SecretError` if the text starts with `TCS-` but is malformed or has a wrong checksum; free-form text passes
+
+**`parse_secret(secret: str) -> ParsedSecret`**
+- Split into `prefix`, `secret_body`, `checksum`, `text`, `checksum_valid` (and `.preimage`); a wrong checksum is reported by `checksum_valid` rather than raising
+- **Raises**: `SecretError` if the text is not a well-formed `TCS-` secret (wrong prefix, length or characters)
+
+**`secret_to_preimage(text: str, *, verify_checksum: bool = True) -> bytes`**
+- Secret text → preimage: stripped, UTF-8 encoded, 1–64 bytes
+- **Raises**: `SecretError`
+
+**`hash_preimage(secret: str, *, verify_checksum: bool = True) -> bytes`**
+- `SHA-256(preimage)` (single round) — the `secret_hash` of a HASHLOCK output
+
+**`soft_warnings(text: str) -> List[str]`**
+- Non-blocking warnings, e.g. text starting with `tcs-` in a different case (probably a generated secret whose case was changed)
+
+**`class SecretError(ValueError)`** (alias `SecretFormatError`)
+- Raised for malformed `TCS-` secrets, empty text, and preimages outside 1–64 bytes
+
+### TMSG Module
+
+```python
+from tencoinlib import tmsg
+```
+
+#### Encryption and decryption
+
+**`tmsg.encrypt(data: bytes, recipients, *, version: int = None, rpc=None) -> bytes`**
+- Encrypt bytes to one or more public keys; returns the TMSG payload
+- `recipients`: a key, a list of keys, or addresses (with `rpc`). `version=None` picks v1 for one key and v2 for several; forcing v1 needs exactly one key
+- **Raises**: `TMSGKeyError`, `TMSGFormatError`, `TMSGSizeError`
+
+**`tmsg.decrypt(payload: Union[bytes, str], private_keys) -> bytes`**
+- Decrypt a payload (bytes or hex) with one private key or a list to try in order
+- **Raises**: `TMSGFormatError` (not a TMSG), `TMSGDecryptionError` (wrong key or modified), `TMSGKeyError`
+
+**`tmsg.encrypt_text(text: str, recipients, *, as_hex: bool = False, rpc=None) -> Union[bytes, str]`** / **`tmsg.decrypt_text(payload, private_keys) -> str`**
+- UTF-8 text helpers; `decrypt_text` raises `TMSGFormatError` if the plaintext is not UTF-8
+
+**`tmsg.inspect(payload) -> TMSGInfo`**
+- Validate the structure without a key: `version`, `recipients`, `payload_size`, `overhead`, `plaintext_size`
+
+**`tmsg.is_tmsg(data) -> bool`**, **`tmsg.overhead(recipients: int = 1, version: int = None) -> int`**, **`tmsg.max_plaintext(recipients: int = 1, version: int = None, limit: int = 1024) -> int`**, **`tmsg.select_version(recipients: int) -> int`**
+
+#### Keys
+
+**`tmsg.normalize_public_key(key, *, rpc=None) -> bytes`**, **`tmsg.parse_public_keys(recipients, *, rpc=None) -> List[bytes]`**
+- Accept bytes (33/65), hex, several keys in one string, addresses (with `rpc`) or `PublicKeyInfo`; return validated 33-byte compressed keys (duplicates dropped, at most 255)
+
+**`tmsg.normalize_private_key(key) -> bytes`**, **`tmsg.public_key_from_private_key(key) -> bytes`**
+
+#### Files and folders
+
+**`tmsg.encrypt_file(path, recipients, output=None, *, overwrite: bool = False, max_size: int = 1 GiB, rpc=None) -> FileResult`** / **`tmsg.decrypt_file(path, private_keys, output=None, *, overwrite: bool = False, max_size: int = 1 GiB) -> FileResult`**
+
+**`tmsg.encrypt_folder(path, recipients, output=None, *, mode: str = "archive", overwrite: bool = False, max_size: int = 1 GiB, rpc=None) -> FolderResult`**
+- `mode="archive"`: one `<name>.zip.enc`; `mode="files"`: `<name>_enc/` with `.enc` on every file. A `.zip` file is accepted as input
+
+**`tmsg.decrypt_folder(path, private_keys, output=None, *, overwrite: bool = False, max_size: int = 1 GiB, max_extract_size: int = 4 GiB, max_files: int = 100000) -> FolderResult`**
+- Accepts a `.zip.enc` file or a folder of `.enc` files; unsafe archive entries are skipped (`result.skipped`)
+
+**`FileResult`**: `path`, `input_size`, `output_size`, `version`, `recipients`. **`FolderResult`**: `output`, `mode`, `files`, `input_size`, `output_size`, `version`, `recipients`, `errors`, `skipped`, `ok`.
+
+#### On-chain
+
+**`tmsg.build_tmsg_transaction(utxos, to_address, message, recipients=None, *, amount: int = 1, fee: int = None, fee_rate: int = None, change_address: str = None, rpc=None, select: bool = True, size_policy: str = "error", version: int = None) -> TMSGTransaction`**
+- Build the unsigned transaction (output 0 payment, output 1 `OP_RETURN`, output 2 change). `select=True` spends the fewest, largest UTXOs; `select=False` spends all of them
+- **Raises**: `TMSGError` (invalid arguments, insufficient funds, would burn more than dust), `TMSGSizeError`, `TMSGKeyError`
+
+**`TMSGTransaction`**
+- Attributes: `tx`, `payload`, `recipients`, `version`, `fee`, `amount`, `change`, `plaintext_size`, `padding`, `signed`, `broadcast_txid`, `txid`
+- `sign(private_keys) -> TMSGTransaction`: sign every input (P2WPKH / P2PKH) with the key whose HASH160 matches; raises `TMSGKeyError` if an input has no key
+- `raw_transaction`: hex for `send_raw_transaction`; raises `TMSGError` before `sign()`
+
+**`tmsg.extract_tmsg_payloads(source, *, rpc=None) -> List[OnChainTMSG]`** (`output_index`, `payload`)
+
+**`tmsg.decrypt_transaction(source, private_keys, *, rpc=None) -> List[DecryptedMessage]`** (`output_index`, `plaintext`, `text`)
+
+**`tmsg.parse_op_return(script: bytes) -> Optional[bytes]`**, **`tmsg.op_return_script_length(data_length: int) -> int`**
+
+### PublicKeyInfo
+
+```python
+from tencoinlib.rpc import PublicKeyInfo, public_key_matches_address, compress_public_key
+```
+
+**`PublicKeyInfo`** (returned by `rpc.get_public_key()`): `address`, `public_key` (bytes, as revealed on-chain), `public_key_hex`, `compressed` (33 bytes), `format` (`"compressed"` or `"uncompressed"`), `txid`, `input_index`, `location` (`"witness"` or `"scriptSig"`), `height`, `node_verified`
+
+**`public_key_matches_address(pubkey: bytes, address: str) -> bool`**
+- `True` if the key is the one behind a P2PKH, P2WPKH or P2SH-P2WPKH address
+
+**`compress_public_key(pubkey: bytes) -> bytes`**
+- 33-byte compressed form of a 33- or 65-byte key; `ValueError` if the point is not on secp256k1
+
 ---
 
 ## Error Handling
@@ -3006,6 +4095,8 @@ SegWit transaction signer (BIP-143) for P2WPKH addresses.
 ```python
 from tencoinlib import WalletError, WalletLockedError, WalletAuthError
 from tencoinlib.wallet_storage.tcw import TCWFormatError, TCWVersionError, TCWAuthError
+from tencoinlib.wallet_storage.tce import TCEError, TCEFormatError, TCEAuthError, TCEVersionError
+from tencoinlib.wallet_storage.esp_bridge import ESPBridgeError
 from tencoinlib.transaction import (
     TransactionBuilderError,
     SigningError,
@@ -3020,6 +4111,19 @@ from tencoinlib.rpc import (
     InvalidMethodError
 )
 from tencoinlib.message import MessageSigningError
+from tencoinlib import (
+    HashlockError,
+    InvalidHashlockSecretError,
+    InvalidHashlockUTXOError,
+    HashlockSpendBuildError,
+    HashlockSpendSigningError,
+    SecretError,
+    TMSGError,
+    TMSGKeyError,
+    TMSGFormatError,
+    TMSGDecryptionError,
+    TMSGSizeError,
+)
 ```
 
 ### Wallet Errors
@@ -3054,6 +4158,25 @@ except TCWFormatError as e:
     print(f"Not a valid TCW file: {e}")
 except TCWVersionError as e:
     print(f"Unsupported TCW version: {e}")
+```
+
+### ESP Bridge Errors
+
+```python
+from tencoinlib.wallet_storage.tce import TCEAuthError, TCEFormatError
+from tencoinlib.wallet_storage.esp_bridge import ESPBridgeError
+
+try:
+    blob = wallet.export_to_esp_blob(esp_password="device-password")
+except ESPBridgeError as e:
+    print(f"Wallet type has no ESP equivalent: {e}")
+
+try:
+    wallet = Wallet.import_from_esp_blob(blob, esp_password="wrong-password")
+except TCEAuthError:
+    print("Wrong ESP password or corrupted blob")
+except TCEFormatError as e:
+    print(f"Not a valid TCE1 blob: {e}")
 ```
 
 ### Transaction Errors
@@ -3114,6 +4237,76 @@ except SigningError as e:
     print(f"SegWit signing error: {e}")
 ```
 
+### Hashlock Errors
+
+```
+HashlockError(Exception)                       base class
+├── InvalidHashlockSecretError(ValueError)     malformed secret (bad TCS checksum, empty, > 64 bytes) or secret does not match the UTXO's hash
+├── InvalidHashlockUTXOError(ValueError)       not a usable C2 UTXO (wrong flag, bad fields, no secret_hash, unsupported owner script)
+├── HashlockSpendBuildError(ValueError)        bad destination / amount / fee, or the transaction cannot be built
+└── HashlockSpendSigningError(SigningError)    wrong key, outpoint mismatch, unsigned input at finalize
+```
+
+```python
+from tencoinlib import (
+    HashlockError, InvalidHashlockSecretError, InvalidHashlockUTXOError,
+    HashlockSpendBuildError, HashlockSpendSigningError,
+)
+from tencoinlib.wallet import WalletLockedError
+
+try:
+    with wallet.unlocked(password):
+        result = wallet.spend_hashlock(utxo, destination, secret=secret)
+except InvalidHashlockSecretError as e:
+    print(f"Secret problem: {e}")            # typo in a TCS secret, or the wrong secret
+except InvalidHashlockUTXOError as e:
+    print(f"Not a spendable HASHLOCK UTXO: {e}")
+except HashlockSpendBuildError as e:
+    print(f"Cannot build the transaction: {e}")   # fee too high, missing change_address, bad address, ...
+except HashlockSpendSigningError as e:
+    print(f"Cannot sign: {e}")               # this wallet's keys do not own the UTXO
+except WalletLockedError:
+    print("Unlock the wallet first")
+except HashlockError as e:
+    print(f"Hashlock error: {e}")
+```
+
+Errors from `add_hashlock_output()` (creating a HASHLOCK output) are `TransactionBuilderError`; the `TCS-` helpers (`secret_to_preimage()`, `check_secret()`, ...) raise `SecretError`.
+
+### TMSG Errors
+
+```
+TMSGError(Exception)                       base class
+├── TMSGKeyError(ValueError)               invalid / unresolvable public or private key, too many recipients
+├── TMSGFormatError(ValueError)            not a TMSG payload (magic, version, length, hex, archive)
+├── TMSGDecryptionError(ValueError)        wrong key, or the payload was modified
+├── TMSGSizeError(ValueError)              does not fit, or an unsafe OP_RETURN size (.size, .limit, .pad_bytes)
+└── TMSGDependencyError(ImportError)       coincurve / cryptography missing
+```
+
+```python
+from tencoinlib import tmsg
+from tencoinlib.rpc import PublicKeyNotFoundError, PublicKeyVerificationError
+
+try:
+    tx = tmsg.build_tmsg_transaction(utxos, to, text, rpc=rpc, change_address=addr)
+except PublicKeyNotFoundError:
+    print("The recipient never spent from that address: ask them for their public key")
+except PublicKeyVerificationError:
+    print("The node returned a key that does not match the address")
+except tmsg.TMSGSizeError as e:
+    print(f"Message does not fit or has an unsafe size: {e}")      # e.pad_bytes: add this many bytes
+except tmsg.TMSGError as e:
+    print(f"Cannot build the TMSG transaction: {e}")
+
+try:
+    text = tmsg.decrypt_text(payload, private_key)
+except tmsg.TMSGDecryptionError:
+    print("Wrong key, or the message was modified")
+except tmsg.TMSGFormatError:
+    print("Not a TMSG payload")
+```
+
 ### RPC Errors
 
 ```python
@@ -3122,7 +4315,9 @@ from tencoinlib.rpc import (
     ConnectionError,
     AuthenticationError,
     TimeoutError,
-    ResponseError
+    ResponseError,
+    PublicKeyNotFoundError,        # getpublickey: the address never spent, so no key is on-chain
+    PublicKeyVerificationError     # getpublickey: the node's key does not match the address
 )
 
 try:
@@ -3156,7 +4351,7 @@ from tencoinlib import (
     DEFAULT_RPC_PORT,      # 10111 - Default RPC port
     DEFAULT_RPC_TOKEN,     # "" - Default RPC token
     COIN_TYPE,             # 5353 - Coin type for BIP-44-style paths
-    DERIVATION_PATH        # "m/84'/5353'/0'/0/0" - Default BIP-84 (P2WPKH) derivation path
+    DERIVATION_PATH        # "m/44'/5353'/0'/0/0" - Default BIP-44 (P2PKH) derivation path
 )
 ```
 
@@ -3170,6 +4365,41 @@ FeeCalculator.PRIORITY_FEE_RATE   # 50 Tenos/byte
 FeeCalculator.ECONOMY_FEE_RATE    # 10 Tenos/byte
 ```
 
+### TMSG and OP_RETURN Constants
+
+```python
+from tencoinlib.tmsg import (
+    TMSG_MAGIC,            # b"TMSG"
+    TMSG_VERSION_1,        # 0x01 - one recipient key
+    TMSG_VERSION_2,        # 0x02 - 2..255 recipient keys
+    TMSG_MAX_RECIPIENTS,   # 255
+    TMSG_MIN_PAYMENT,      # 1 Teno - minimum payment of a TMSG transaction (the dust limit does not apply)
+    OP_RETURN_MAX_DATA,    # 1024 - data bytes allowed in an OP_RETURN output
+)
+from tencoinlib.constants import (
+    OUTPUT_FLAG_RANGE,     # range(0xC1, 0xD0) - OP_RETURN scripts of 193..207 bytes are never produced
+    TMSG_GCM_TAG_SIZE,     # 16
+    TMSG_NONCE_SIZE,       # 12
+)
+```
+
+### HASHLOCK and Secret Constants
+
+```python
+from tencoinlib import (
+    COND_FLAG_HASHLOCK,       # 0xC2 - HASHLOCK conditional output flag
+    HASHLOCK_MIN_PREIMAGE,    # 1  - Minimum preimage size in bytes
+    HASHLOCK_MAX_PREIMAGE,    # 64 - Maximum preimage size in bytes
+    HASHLOCK_HASH_SIZE,       # 32 - Size of secret_hash (SHA-256, single round)
+)
+from tencoinlib.constants import (
+    SECRET_PREFIX,            # "TCS-"
+    SECRET_BODY_LENGTH,       # 55 random characters
+    SECRET_CHECKSUM_LENGTH,   # 5 checksum characters
+    SECRET_TOTAL_LENGTH,      # 64 characters in total (the prefix is counted)
+)
+```
+
 ### Address Constants
 
 ```python
@@ -3177,6 +4407,16 @@ from tencoinlib.constants import (
     P2PKH_VERSION,    # 0x41 - Address version for P2PKH (legacy 'T...' addresses)
     P2SH_VERSION,     # 0x32 - Address version for P2SH (legacy 'M...' addresses)
     P2WPKH_VERSION    # 0     - Witness version for P2WPKH (SegWit 'tc1q...' addresses)
+)
+```
+
+### BIP-32 Purpose Constants
+
+```python
+from tencoinlib.constants import (
+    BIP44_PURPOSE,    # 44 - Legacy P2PKH
+    BIP49_PURPOSE,    # 49 - Nested SegWit (P2SH-P2WPKH)
+    BIP84_PURPOSE,    # 84 - Native SegWit (P2WPKH)
 )
 ```
 
@@ -3255,6 +4495,55 @@ from tencoinlib.constants import (
 8. **Use change addresses**
    - Always set a change address to protect privacy
    - Use new change addresses for each transaction
+
+### TMSG Messages
+
+1. **Check the key before you encrypt**
+   - A wrong public key sends your message to someone else. Prefer `rpc.get_public_key()` (verified against the address) or a key the owner gave you directly; never type keys from memory
+   - Pass the recipient's address together with `rpc=rpc` instead of copying the key by hand
+
+2. **Remember that TMSG does not identify the sender**
+   - Anyone can encrypt to a public key. If the sender must be provable, sign the plaintext (Message Signing) or include a signature in the message
+
+3. **Encrypt to yourself too** if you need to read what you sent
+   - `include_self=True` in `wallet.send_tmsg()`, or add your own public key to `recipients` (this makes it a v2 message: 93 bytes more overhead per recipient)
+
+4. **Keep recipient lists small on-chain**
+   - Every recipient costs 93 bytes of the 1024-byte `OP_RETURN`; for large groups encrypt a file off-chain and send only its location / hash
+
+5. **Dry-run before broadcasting**
+   - `rpc.test_mempool_accept(tx.raw_transaction)`; a data-carrying transaction may need a higher fee than the default (`fee_rate=` / `fee=`)
+
+6. **Mind the private key**
+   - Whoever holds the private key can read every message encrypted to its public key, past and future. Rotate to a new address and key for new conversations if a key may have leaked
+
+7. **Be careful with unknown encrypted archives**
+   - `decrypt_folder()` skips unsafe paths and bounds the output size, but still extract into a folder you can throw away, and lower `max_extract_size` if you expect small archives
+
+### HASHLOCK Secrets
+
+1. **Generate secrets with `generate_secret()`**
+   - It uses the operating system's CSPRNG and adds the typo-catching checksum
+   - Use a fresh secret for every lock: the preimage becomes public when the spend is broadcast
+
+2. **Never log or store a whole secret**
+   - Log at most the first 8 characters, or the hash (`hash_preimage(secret)`)
+
+3. **Keep the secret text exact**
+   - The whole text is the preimage: do not change its case, re-group it or re-encode it
+   - Only the two ends are stripped
+
+4. **Verify before you sign and broadcast**
+   ```python
+   if not verify_hashlock_secret(secret, utxo["secret_hash"]):
+       raise ValueError("This is not the secret for this UTXO")
+   ```
+
+5. **Test before sending a real amount**
+   - Check `rpc.test_mempool_accept(result.raw_transaction)` or start with a small amount; the library cannot validate the transaction against the node's consensus rules
+
+6. **Remember that both halves are needed**
+   - To let someone claim a HASHLOCK output, lock it to their address *and* give them the secret
 
 ### Performance
 

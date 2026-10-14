@@ -39,13 +39,31 @@ Files use the TCW v1 binary format (see wallet_storage/tcw.py):
 Address types
 -------------
 The wallet's *canonical* address type is determined at construction:
-  - create() / recover()  → P2WPKH (BIP-84, m/84'/COIN_TYPE'/0'/0/0)
+  - create() / recover()  → P2PKH (BIP-44, m/44'/COIN_TYPE'/0'/0/0)
   - from_xpub()           → P2WPKH (derived from provided xpub at 0/0)
-  - from_xprv()           → P2WPKH (derived from provided xprv at 0/0)
+  - from_xprv()           → P2PKH  (derived from provided xprv at 0/0)
+  - from_private_key()    → P2PKH  (raw key, no chain code, no HD tree)
 
-get_address(type=...) still allows on-the-fly derivation of other
-address forms (P2PKH, P2SH, P2WSH) from the seed, but these are
-*not* the canonical wallet identity and are not stored in the .tcw file.
+get_address(type=...) allows on-the-fly derivation of other address
+forms (P2WPKH native SegWit via BIP-84, P2SH nested SegWit via BIP-49,
+P2WSH) from the seed.  These are not the canonical wallet identity and
+are not stored in the .tcw file.  Not available on from_private_key()
+wallets, which have no chain code to derive anything else from.
+
+Each address type is derived under its own BIP-32 purpose field, with
+no path shared between them:
+  P2PKH        -> BIP-44 -> m/44'/COIN_TYPE'/account'/change/index
+  P2SH-P2WPKH  -> BIP-49 -> m/49'/COIN_TYPE'/account'/change/index
+  P2WPKH       -> BIP-84 -> m/84'/COIN_TYPE'/account'/change/index
+
+ESP32 bridge
+------------
+export_to_esp_blob()/import_from_esp_blob() and the module-level
+wallet_storage.esp_bridge helpers (esp_blob_to_tcw_file /
+tcw_file_to_esp_blob) translate wallet secrets to/from the ESP32
+firmware's own encrypted blob format (TCE1: PBKDF2-HMAC-SHA256 instead
+of Argon2id, since ESP32 cannot run Argon2id). Only "hd" and "privkey"
+wallets have an ESP equivalent; see wallet_storage/esp_bridge.py.
 """
 
 import json
@@ -66,7 +84,9 @@ from .keys.bip39 import (
     validate_mnemonic,
 )
 from .keys.bip84 import get_default_address_from_seed, public_key_to_segwit_v0
-from .constants import BIP44_PURPOSE, BIP84_PURPOSE, COIN_TYPE, DERIVATION_PATH
+from .keys.bip44 import bip44_account_path
+from .keys.bip49 import bip49_account_path, public_key_to_p2sh_segwit
+from .constants import BIP44_PURPOSE, BIP49_PURPOSE, BIP84_PURPOSE, COIN_TYPE, DERIVATION_PATH
 from .transaction.script import (
     build_multisig_script,
     pubkey_to_p2pkh_address,
@@ -101,7 +121,7 @@ class WalletAuthError(WalletError):
 
 class Wallet:
     """
-    HD Wallet for Tencoin (BIP-39 + BIP-84 + full BIP-32).
+    HD Wallet for Tencoin (BIP-39 + BIP-44 + full BIP-32).
 
     Supports:
       - Seed-based wallets (create / recover)
@@ -148,7 +168,7 @@ class Wallet:
     @classmethod
     def create(cls, strength: int = 128) -> "Wallet":
         """
-        Create a new HD wallet (BIP-39 mnemonic + BIP-32/BIP-84).
+        Create a new HD wallet (BIP-39 mnemonic + BIP-32/BIP-44).
 
         The returned wallet is UNLOCKED (secrets are in RAM).
         Call save() to persist to a TCW file, then lock() or use the
@@ -232,6 +252,49 @@ class Wallet:
         w._imported_xprv  = xprv
         w._imported_xpub  = ext_pub.to_xpub()
         w._locked         = False
+        return w
+
+    @classmethod
+    def from_private_key(cls, private_key: Union[bytes, str]) -> "Wallet":
+        """
+        Create a wallet from a single raw 32-byte private key — no
+        mnemonic, no seed, no BIP-32 chain code, no HD derivation.
+
+        This is distinct from from_xprv(): an xprv carries a chain code
+        and can derive a whole tree of child keys, while a bare private
+        key cannot derive anything else. It exists to round-trip the
+        ESP32 firmware's "imported" wallet type (see
+        wallet_storage/esp_bridge.py), which stores exactly this: one
+        key, nothing more.
+
+        The returned wallet is UNLOCKED. Its canonical address is
+        legacy P2PKH, matching the ESP firmware. Operations that need a
+        chain code (get_master_xprv/xpub, derive_xprv/xpub,
+        get_account_xprv/xpub, get_address("p2wpkh"/"p2sh")) are not
+        available on this wallet type and raise WalletError.
+
+        Args:
+            private_key: 32-byte private key, as bytes or a 64-char hex string.
+
+        Returns:
+            UNLOCKED Wallet instance (wallet_type == "privkey").
+        """
+        from .keys.ec import privkey_to_pubkey
+
+        key_bytes = bytes.fromhex(private_key) if isinstance(private_key, str) else private_key
+        if len(key_bytes) != 32:
+            raise WalletError(f"Private key must be 32 bytes, got {len(key_bytes)}")
+
+        pub  = privkey_to_pubkey(key_bytes, compressed=True)
+        addr = pubkey_to_p2pkh_address(pub)
+
+        w = cls()
+        w.address        = addr
+        w.public_key     = pub.hex()
+        w.is_watch_only  = False
+        w._wallet_type   = "privkey"
+        w._private_key   = key_bytes
+        w._locked        = False
         return w
 
     @classmethod
@@ -546,32 +609,49 @@ class Wallet:
         """
         Return an address for the current key in the requested form.
 
-        For p2wpkh: available while locked (uses public metadata).
-        For p2pkh / p2sh: requires UNLOCKED (seed derivation needed).
+        For p2pkh: available while locked (canonical BIP-44 address stored).
+        For p2wpkh: requires UNLOCKED (BIP-84 derived on-the-fly).
+        For p2sh: requires UNLOCKED if no script is provided (BIP-49
+                  nested SegWit, P2SH-P2WPKH, derived on-the-fly).
         For p2wsh: script= required, no unlock needed if script is provided.
 
         Args:
-            type:   "p2wpkh" | "p2pkh" | "p2sh" | "p2wsh"
+            type:   "p2pkh" | "p2wpkh" | "p2sh" | "p2wsh"  (default: p2pkh)
             script: For p2sh (optional) or p2wsh (required).
 
         Returns:
             Address string.
         """
-        addr_type = (type or "p2wpkh").lower().strip()
+        addr_type = (type or "p2pkh").lower().strip()
 
-        if addr_type == "p2wpkh":
-            return self.address
+        if self._wallet_type == "privkey" and addr_type != "p2pkh":
+            raise WalletError(
+                f"get_address({addr_type!r}) is not available: this wallet "
+                "was created from a raw private key (no BIP-32 chain code, "
+                "so no other address types can be derived from it)."
+            )
 
         if addr_type == "p2pkh":
-            self._require_unlocked("get_address('p2pkh')")
-            pubkey_bytes = self._derive_bip44_pubkey(account=0, change=0, index=0)
-            return pubkey_to_p2pkh_address(pubkey_bytes)
+            # Canonical address — already stored (BIP-44 m/44'/COIN_TYPE'/0'/0/0)
+            return self.address
+
+        if addr_type == "p2wpkh":
+            # SegWit native — derived on-the-fly from BIP-84 (m/84'/COIN_TYPE'/0'/0/0)
+            self._require_unlocked("get_address('p2wpkh')")
+            from .keys.bip84 import derive_bip84_address_from_seed
+            _, segwit_addr = derive_bip84_address_from_seed(
+                self._seed, account=0, change=0, index=0
+            )
+            return segwit_addr
 
         if addr_type == "p2sh":
             if script is None:
+                # Nested SegWit (P2SH-P2WPKH) — derived on-the-fly from
+                # BIP-49 (m/49'/COIN_TYPE'/0'/0/0), its own purpose field,
+                # separate from both BIP-44 (P2PKH) and BIP-84 (P2WPKH).
                 self._require_unlocked("get_address('p2sh')")
-                pubkey_bytes = self._derive_bip44_pubkey(account=0, change=0, index=0)
-                return pubkey_to_p2sh_p2pkh_address(pubkey_bytes)
+                pubkey_bytes = self._derive_bip49_pubkey(account=0, change=0, index=0)
+                return public_key_to_p2sh_segwit(pubkey_bytes)
             return script_to_p2sh_address(script)
 
         if addr_type == "p2wsh":
@@ -582,7 +662,7 @@ class Wallet:
             return script_to_p2wsh_address(script)
 
         raise WalletError(
-            f"Unknown address type: {type!r}. Use p2wpkh, p2pkh, p2sh, or p2wsh."
+            f"Unknown address type: {type!r}. Use p2pkh, p2wpkh, p2sh, or p2wsh."
         )
 
     # ------------------------------------------------------------------
@@ -655,19 +735,59 @@ class Wallet:
         return master_pub.to_xpub()
 
     # ------------------------------------------------------------------
-    # Account-level BIP-84 API
+    # Account-level API (BIP-44 / BIP-49 / BIP-84)
     # ------------------------------------------------------------------
+    #
+    # Each address type has its own, fully independent purpose field and
+    # therefore its own account path:
+    #   P2PKH            (legacy)        -> m/44'/COIN_TYPE'/account'
+    #   P2SH-P2WPKH      (nested SegWit) -> m/49'/COIN_TYPE'/account'
+    #   P2WPKH           (native SegWit) -> m/84'/COIN_TYPE'/account'
+    #
+    # get_account_xprv/get_account_xpub default to the BIP-84 path for
+    # backward compatibility with existing callers, but accept an
+    # explicit `purpose` to reach the BIP-44 or BIP-49 branch instead.
+    # The bip44_account_path/bip49_account_path/_account_path helpers
+    # never fall back on one another's purpose value.
 
-    def _account_path(self, account: int) -> str:
-        return f"m/{BIP84_PURPOSE}'/{COIN_TYPE}'/{account}'"
+    def _account_path(self, account: int, purpose: int = BIP84_PURPOSE) -> str:
+        return f"m/{purpose}'/{COIN_TYPE}'/{account}'"
 
-    def get_account_xprv(self, account: int) -> str:
-        """Account xprv at m/84'/COIN_TYPE'/account' (UNLOCKED required)."""
-        return self.derive_xprv(self._account_path(account))
+    def get_account_xprv(self, account: int, purpose: int = BIP84_PURPOSE) -> str:
+        """
+        Account xprv at m/{purpose}'/COIN_TYPE'/account' (UNLOCKED required).
 
-    def get_account_xpub(self, account: int) -> str:
-        """Account xpub at m/84'/COIN_TYPE'/account'."""
-        return self.derive_xpub(self._account_path(account))
+        `purpose` defaults to 84 (native SegWit) for backward
+        compatibility. Pass BIP44_PURPOSE (44) or BIP49_PURPOSE (49)
+        explicitly for the legacy P2PKH or nested-SegWit account branch.
+        """
+        return self.derive_xprv(self._account_path(account, purpose))
+
+    def get_account_xpub(self, account: int, purpose: int = BIP84_PURPOSE) -> str:
+        """
+        Account xpub at m/{purpose}'/COIN_TYPE'/account'.
+
+        `purpose` defaults to 84 (native SegWit) for backward
+        compatibility. Pass BIP44_PURPOSE (44) or BIP49_PURPOSE (49)
+        explicitly for the legacy P2PKH or nested-SegWit account branch.
+        """
+        return self.derive_xpub(self._account_path(account, purpose))
+
+    def get_account_xprv_p2pkh(self, account: int = 0) -> str:
+        """BIP-44 account xprv at m/44'/COIN_TYPE'/account' (UNLOCKED required)."""
+        return self.derive_xprv(bip44_account_path(account))
+
+    def get_account_xpub_p2pkh(self, account: int = 0) -> str:
+        """BIP-44 account xpub at m/44'/COIN_TYPE'/account'."""
+        return self.derive_xpub(bip44_account_path(account))
+
+    def get_account_xprv_p2sh_segwit(self, account: int = 0) -> str:
+        """BIP-49 account xprv at m/49'/COIN_TYPE'/account' (UNLOCKED required)."""
+        return self.derive_xprv(bip49_account_path(account))
+
+    def get_account_xpub_p2sh_segwit(self, account: int = 0) -> str:
+        """BIP-49 account xpub at m/49'/COIN_TYPE'/account'."""
+        return self.derive_xpub(bip49_account_path(account))
 
     # ------------------------------------------------------------------
     # Address derivation
@@ -755,6 +875,96 @@ class Wallet:
         self.is_watch_only    = False
 
     # ------------------------------------------------------------------
+    # ESP32 bridge (Extract to ESP / Import from ESP)
+    # ------------------------------------------------------------------
+    #
+    # See wallet_storage/esp_bridge.py and ESP_WALLET_STRUCTURE.md for the
+    # full design. Ciphertext bytes are never copied directly between the
+    # two formats (different KDF/AAD/key) — both directions go through
+    # the shared plaintext payload.
+
+    def export_to_esp_blob(
+        self,
+        esp_password: str,
+        iterations: int = None,
+        totp: Optional[List[str]] = None,
+        totp_mask: Optional[int] = None,
+        passphrase_used: Optional[bool] = None,
+    ) -> bytes:
+        """
+        Encrypt this wallet's secret material as a TCE1 blob for the
+        ESP32 (UNLOCKED required).
+
+        Only "hd" wallets (mnemonic + seed) and "privkey" wallets (a
+        single raw imported key, e.g. from Wallet.from_private_key())
+        can be exported — "xprv" and "xpub" wallets are rejected with a
+        clear error (see tcw_payload_to_esp_payload).
+
+        Args:
+            esp_password:    Password to protect the ESP blob (may differ
+                             from this wallet's own .tcw password, if any).
+            iterations:      PBKDF2 iteration count, 1..10000. Defaults to
+                             the ESP32 ceiling.
+            totp:            Optional 2FA slots to embed.
+            totp_mask:       Optional 2FA slot-enabled bitmask.
+            passphrase_used: Optional BIP-39 25th-word flag to embed.
+
+        Returns:
+            Raw TCE1 blob bytes (send blob.hex() to the ESP32's
+            POST /api/wallet/import).
+        """
+        self._require_unlocked("export_to_esp_blob")
+        from .wallet_storage.esp_bridge import tcw_payload_to_esp_payload, validate_esp_payload
+        from .wallet_storage.tce import encrypt_esp_blob
+        from .wallet_storage.kdf import PBKDF2_MAX_ITERATIONS
+
+        if iterations is None:
+            iterations = PBKDF2_MAX_ITERATIONS
+
+        tcw_payload = self._to_payload()
+        esp_payload = tcw_payload_to_esp_payload(
+            tcw_payload, totp=totp, totp_mask=totp_mask, passphrase_used=passphrase_used
+        )
+        validate_esp_payload(esp_payload)
+        return encrypt_esp_blob(esp_payload, esp_password, iterations=iterations)
+
+    @classmethod
+    def import_from_esp_blob(cls, blob: bytes, esp_password: str) -> "Wallet":
+        """
+        Decrypt a TCE1 blob exported from the ESP32 and build an
+        UNLOCKED Wallet from it directly (no intermediate .tcw file).
+
+        The result is wallet_type "hd" (if the ESP wallet was HD) or
+        "privkey" (if it was a raw imported key), mirroring the ESP
+        firmware's own wallet_type field exactly.
+
+        Args:
+            blob:         Raw TCE1 bytes read from the ESP32's
+                          GET /api/wallet/export.
+            esp_password: The password protecting the ESP wallet.
+
+        Returns:
+            UNLOCKED Wallet instance.
+
+        Raises:
+            TCEAuthError:   Wrong esp_password, or the blob is
+                            corrupted/tampered.
+            TCEFormatError: blob is not a valid TCE1 container.
+            ESPBridgeError: Decrypted payload is malformed or inconsistent.
+        """
+        from .wallet_storage.tce import decrypt_esp_blob
+        from .wallet_storage.esp_bridge import validate_esp_payload, esp_payload_to_tcw_payload
+
+        esp_payload = decrypt_esp_blob(blob, esp_password)
+        validate_esp_payload(esp_payload)
+        tcw_payload = esp_payload_to_tcw_payload(esp_payload)
+
+        w = cls()
+        w._locked = False
+        w._load_from_payload(tcw_payload)
+        return w
+
+    # ------------------------------------------------------------------
     # Serialisation  (internal)
     # ------------------------------------------------------------------
 
@@ -775,6 +985,10 @@ class Wallet:
             "mnemonic":        self._mnemonic,
             "seed_hex":        self._seed.hex() if self._seed else None,
             "imported_xprv":   self._imported_xprv,
+            "raw_private_key_hex": (
+                self._private_key.hex()
+                if self._wallet_type == "privkey" and self._private_key else None
+            ),
             # --- public material (kept inside payload for privacy) ---
             "imported_xpub":   self._imported_xpub,
             "address":         self.address,
@@ -816,22 +1030,25 @@ class Wallet:
         imp_xprv = payload.get("imported_xprv")
 
         if wallet_type == "hd":
+            from .keys.ec import privkey_to_pubkey as _privkey_to_pubkey
+            _bip44_path = f"m/{BIP44_PURPOSE}'/{COIN_TYPE}'/0'/0/0"
+
             if mnemonic:
-                self._mnemonic   = mnemonic
-                self._seed       = bytes.fromhex(seed_hex) if seed_hex else mnemonic_to_seed(mnemonic)
-                priv, pub, addr  = get_default_address_from_seed(self._seed)
-                self._private_key = priv
-                self.public_key   = pub
-                self.address      = addr
-                # Lazily derive master keys on demand
+                self._mnemonic = mnemonic
+                self._seed     = bytes.fromhex(seed_hex) if seed_hex else mnemonic_to_seed(mnemonic)
             elif seed_hex:
-                self._seed        = bytes.fromhex(seed_hex)
-                priv, pub, addr   = get_default_address_from_seed(self._seed)
-                self._private_key = priv
-                self.public_key   = pub
-                self.address      = addr
+                self._seed = bytes.fromhex(seed_hex)
             else:
                 raise WalletError("HD wallet payload is missing mnemonic and seed")
+
+            # Canonical key: BIP-44 P2PKH (m/44'/COIN_TYPE'/0'/0/0)
+            priv, _ = derive_path_from_seed(self._seed, _bip44_path)
+            pub     = _privkey_to_pubkey(priv, compressed=True)
+            addr    = pubkey_to_p2pkh_address(pub)
+            self._private_key = priv
+            self.public_key   = pub.hex()
+            self.address      = addr
+            # Lazily derive master keys on demand
 
         elif wallet_type == "xprv":
             if not imp_xprv:
@@ -842,6 +1059,18 @@ class Wallet:
             self._master_xpub   = ext_priv.to_public()
             child_priv          = ext_priv.derive_path("0/0")
             self._private_key   = child_priv.key
+
+        elif wallet_type == "privkey":
+            raw_hex = payload.get("raw_private_key_hex")
+            if not raw_hex:
+                raise WalletError("privkey wallet payload is missing raw_private_key_hex")
+            from .keys.ec import privkey_to_pubkey as _privkey_to_pubkey
+            self._private_key = bytes.fromhex(raw_hex)
+            pub = _privkey_to_pubkey(self._private_key, compressed=True)
+            self.public_key = pub.hex()
+            self.address    = pubkey_to_p2pkh_address(pub)
+            # No chain code was ever provided for a raw imported key, so
+            # there is no master xprv/xpub to reconstruct here.
 
         elif wallet_type == "xpub":
             # Watch-only: no secret material to restore
@@ -864,6 +1093,11 @@ class Wallet:
     def _ensure_master_xprv(self) -> ExtendedPrivateKey:
         if self.is_watch_only:
             raise WalletError("Master xprv not available in watch-only wallet")
+        if self._wallet_type == "privkey":
+            raise WalletError(
+                "Master xprv not available: this wallet was created from a "
+                "raw private key (no BIP-32 chain code, no HD tree)."
+            )
         if self._master_xprv is None:
             if self._seed is None:
                 raise WalletLockedError(
@@ -875,6 +1109,12 @@ class Wallet:
     def _ensure_master_xpub(self) -> ExtendedPublicKey:
         if self._master_xpub is not None:
             return self._master_xpub
+
+        if self._wallet_type == "privkey":
+            raise WalletError(
+                "Master xpub not available: this wallet was created from a "
+                "raw private key (no BIP-32 chain code, no HD tree)."
+            )
 
         if self._master_xprv is not None:
             self._master_xpub = self._master_xprv.to_public()
@@ -907,31 +1147,361 @@ class Wallet:
         private_key, _ = derive_path_from_seed(self._seed, path)
         return privkey_to_pubkey(private_key, compressed=True)
 
+    def _derive_bip49_pubkey(
+        self, account: int = 0, change: int = 0, index: int = 0
+    ) -> bytes:
+        """
+        Derive compressed public key at m/49'/COIN_TYPE'/account'/change/index.
+        Requires UNLOCKED state (seed needed).
+
+        Kept fully separate from _derive_bip44_pubkey (purpose 44') and
+        from the BIP-84 path (purpose 84') — BIP-49 has its own purpose
+        field and must not "drive on 84'".
+        """
+        if not self._seed:
+            raise WalletLockedError(
+                "Seed not available. Call unlock(password) first."
+            )
+        from .keys.ec import privkey_to_pubkey
+
+        path = f"m/{BIP49_PURPOSE}'/{COIN_TYPE}'/{account}'/{change}/{index}"
+        private_key, _ = derive_path_from_seed(self._seed, path)
+        return privkey_to_pubkey(private_key, compressed=True)
+
+    # ------------------------------------------------------------------
+    # HASHLOCK (C2) spending
+    # ------------------------------------------------------------------
+
+    def _candidate_keys(self, account: int = 0, change: int = 0, index: int = 0) -> List[bytes]:
+        """
+        Private keys this wallet can offer for signing / decrypting: the canonical key plus
+        (seed wallets) the BIP-84 and BIP-44 keys at m/<purpose>'/COIN_TYPE'/account'/change/index.
+        Callers match them against an output script or try them in order; they never guess.
+        """
+        keys: List[bytes] = []
+        if self._private_key:
+            keys.append(self._private_key)
+        if self._seed:
+            for purpose in (BIP84_PURPOSE, BIP44_PURPOSE):
+                path = f"m/{purpose}'/{COIN_TYPE}'/{account}'/{change}/{index}"
+                key, _ = derive_path_from_seed(self._seed, path)
+                if key not in keys:
+                    keys.append(key)
+        return keys
+
+    def _find_hashlock_key(
+        self, owner_hash: bytes, account: int, change: int, index: int
+    ) -> bytes:
+        """
+        Return the private key whose HASH160(pubkey) equals ``owner_hash``.
+
+        Candidates: the canonical key, plus (seed wallets) the BIP-84 and BIP-44
+        keys at m/<purpose>'/COIN_TYPE'/account'/change/index. A key is only used
+        when it provably owns the UTXO.
+        """
+        from .keys.ec import privkey_to_pubkey
+        from .utils import hash160
+
+        for key in self._candidate_keys(account, change, index):
+            if hash160(privkey_to_pubkey(key, compressed=True)) == owner_hash:
+                return key
+
+        from .transaction.hashlock import HashlockSpendSigningError
+        raise HashlockSpendSigningError(
+            "No key of this wallet owns the HASHLOCK UTXO "
+            f"(searched account={account}, change={change}, index={index}). "
+            "Pass the account/change/index the funds were sent to."
+        )
+
+    def sign_hashlock_spend(
+        self,
+        tx,
+        input_index: int,
+        utxo: dict,
+        secret: Union[str, bytes],
+        *,
+        account: int = 0,
+        change: int = 0,
+        index: int = 0,
+    ):
+        """
+        Sign input ``input_index`` of ``tx`` as a HASHLOCK (C2) spend (UNLOCKED required).
+
+        Verifies the secret against the UTXO's secret_hash, finds the wallet key that
+        owns the UTXO, signs, and places [sig, pubkey, preimage] in the witness
+        (P2WPKH owner) or <sig> <pubkey> <preimage> in the scriptSig (P2PKH owner).
+        ``tx`` is modified in place and also returned.
+
+        Args:
+            tx:          unsigned Transaction (e.g. from build_hashlock_spend).
+            input_index: which input spends the C2 UTXO.
+            utxo:        dict with txid, vout, value, script_pubkey, secret_hash.
+            secret:      TCS secret / free-form text (str) or raw preimage (bytes).
+            account, change, index: HD position of the owning key (seed wallets).
+        """
+        from .transaction.hashlock import normalize_hashlock_utxo, sign_hashlock_input
+
+        self._require_unlocked("sign_hashlock_spend")
+        if self.is_watch_only:
+            raise WalletError("Cannot sign with a watch-only wallet")
+        owner = normalize_hashlock_utxo(utxo)
+        key = self._find_hashlock_key(owner.owner_hash, account, change, index)
+        return sign_hashlock_input(tx, input_index, utxo, key, secret)
+
+    def spend_hashlock(
+        self,
+        utxo: dict,
+        destination: str,
+        amount: Optional[int] = None,
+        fee: Optional[int] = None,
+        secret: Union[str, bytes, None] = None,
+        *,
+        fee_rate: Optional[int] = None,
+        change_address: Optional[str] = None,
+        account: int = 0,
+        change: int = 0,
+        index: int = 0,
+    ):
+        """
+        Spend a HASHLOCK (C2) UTXO end to end (UNLOCKED required):
+        validate -> verify secret -> build -> sign -> finalize.
+
+        Returns a HashlockSpendResult; ``result.raw_transaction`` is the hex to broadcast.
+        See transaction.hashlock.build_hashlock_spend for amount / fee / change rules.
+
+            with wallet.unlocked(password):
+                result = wallet.spend_hashlock(utxo, destination, secret=tcs_secret)
+        """
+        from .transaction.hashlock import (
+            HashlockSpendResult,
+            InvalidHashlockSecretError,
+            build_hashlock_spend,
+            finalize_hashlock_spend,
+            normalize_hashlock_utxo,
+        )
+
+        self._require_unlocked("spend_hashlock")
+        if self.is_watch_only:
+            raise WalletError("Cannot sign with a watch-only wallet")
+        if secret is None:
+            raise InvalidHashlockSecretError("secret is required to spend a HASHLOCK UTXO")
+
+        u = normalize_hashlock_utxo(utxo)
+        tx = build_hashlock_spend(
+            utxo, destination, amount=amount, fee=fee, secret=secret,
+            fee_rate=fee_rate, change_address=change_address,
+        )
+        self.sign_hashlock_spend(
+            tx, 0, utxo, secret, account=account, change=change, index=index
+        )
+        raw = finalize_hashlock_spend(tx)
+
+        total_out = sum(o.value for o in tx.vout)
+        sent = tx.vout[0].value
+        return HashlockSpendResult(
+            tx=tx,
+            raw_transaction=raw,
+            txid=tx.txid(),
+            fee=u.value - total_out,
+            amount=sent,
+            change=total_out - sent,
+            secret_hash=u.secret_hash.hex(),
+        )
+
+    # ------------------------------------------------------------------
+    # TMSG (Tencoin Message): encrypted messages
+    # ------------------------------------------------------------------
+
+    def tmsg_public_key(
+        self,
+        address_type: str = "p2wpkh",
+        account: int = 0,
+        change: int = 0,
+        index: int = 0,
+    ) -> str:
+        """
+        Compressed public key (66 hex chars) that others encrypt TMSG messages to.
+
+        Give it to people who want to write to you, or let them find it on-chain with
+        ``rpc.get_public_key(address)`` once that address has spent an output. The key
+        belongs to the address of the same type: "p2wpkh" -> tc1q..., "p2pkh" -> T...
+        (UNLOCKED required; seed wallets can pass account/change/index).
+        """
+        from .tmsg.keys import public_key_from_private_key
+
+        self._require_unlocked("tmsg_public_key")
+        kind = (address_type or "p2wpkh").lower().strip()
+        if kind not in ("p2wpkh", "p2pkh"):
+            raise WalletError("address_type must be 'p2wpkh' or 'p2pkh'")
+        if not self._seed:
+            if kind == "p2wpkh":
+                raise WalletError("p2wpkh keys need a seed wallet; this wallet only has a raw key")
+            key = self._private_key
+        else:
+            purpose = BIP84_PURPOSE if kind == "p2wpkh" else BIP44_PURPOSE
+            key, _ = derive_path_from_seed(
+                self._seed, f"m/{purpose}'/{COIN_TYPE}'/{account}'/{change}/{index}"
+            )
+        return public_key_from_private_key(key).hex()
+
+    def _tmsg_utxos(self, rpc) -> List[dict]:
+        """Spendable UTXOs of the wallet's own addresses (P2PKH, and P2WPKH for seed wallets)."""
+        from .transaction.address import address_to_script
+
+        addresses = [self.address]
+        if self._seed:
+            addresses.append(self.get_address("p2wpkh"))
+        utxos: List[dict] = []
+        for addr in addresses:
+            for u in rpc.list_unspent(addr):
+                utxos.append({
+                    "txid": u["txid"], "vout": u["vout"], "amount": u["amount"],
+                    "script_pubkey": address_to_script(addr), "address": addr,
+                })
+        return utxos
+
+    def send_tmsg(
+        self,
+        rpc,
+        to_address: str,
+        message: Union[str, bytes],
+        recipients=None,
+        *,
+        amount: int = 1,
+        fee: Optional[int] = None,
+        fee_rate: Optional[int] = None,
+        change_address: Optional[str] = None,
+        include_self: bool = False,
+        size_policy: str = "error",
+        utxos: Optional[List[dict]] = None,
+        broadcast: bool = False,
+        account: int = 0,
+        change: int = 0,
+        index: int = 0,
+    ):
+        """
+        Send an encrypted on-chain message (UNLOCKED required).
+
+        Output 0 pays ``amount`` Tenos (default 1, the dust limit does not apply) to
+        ``to_address``; output 1 is an OP_RETURN with the encrypted TMSG; output 2 is the change.
+
+        Args:
+            rpc:            RPCClient (UTXOs, public-key lookup, optional broadcast).
+            to_address:     recipient address.
+            message:        text or bytes. Up to 958 bytes for one recipient.
+            recipients:     public key(s) allowed to decrypt. None = the on-chain key of
+                            ``to_address`` (needs that address to have spent before).
+            include_self:   also encrypt to this wallet so you can read your own message
+                            (makes it a v2 message: 93 bytes more overhead).
+            change_address: default = this wallet's P2PKH address.
+            utxos:          use these UTXOs instead of asking ``rpc`` (dicts with txid, vout,
+                            amount, scriptPubKey). For keys beyond account/change/index 0 pass
+                            those indexes.
+            broadcast:      True = also send it with ``rpc.send_raw_transaction``.
+
+        Returns:
+            TMSGTransaction (already signed; ``.raw_transaction``, ``.txid``, ``.fee``).
+            With ``broadcast=True`` its ``broadcast_txid`` is set.
+        """
+        from .tmsg.keys import parse_public_keys, public_key_from_private_key
+        from .tmsg.onchain import build_tmsg_transaction
+
+        self._require_unlocked("send_tmsg")
+        if self.is_watch_only:
+            raise WalletError("Cannot sign with a watch-only wallet")
+
+        if utxos is None:
+            utxos = self._tmsg_utxos(rpc)
+        if not utxos:
+            raise WalletError("no spendable UTXOs found for this wallet")
+
+        keys = parse_public_keys(recipients if recipients is not None else to_address, rpc=rpc)
+        if include_self:
+            own = public_key_from_private_key(self._private_key)
+            if own not in keys:
+                keys.append(own)
+
+        tx = build_tmsg_transaction(
+            utxos, to_address, message, recipients=keys,
+            amount=amount, fee=fee, fee_rate=fee_rate,
+            change_address=change_address or self.address,
+            rpc=rpc, size_policy=size_policy,
+        )
+        tx.sign(self._candidate_keys(account, change, index))
+        if broadcast:
+            tx.broadcast_txid = rpc.send_raw_transaction(tx.raw_transaction)
+        return tx
+
+    def decrypt_tmsg(
+        self,
+        payload: Union[bytes, str],
+        *,
+        account: int = 0,
+        change: int = 0,
+        index: int = 0,
+    ) -> bytes:
+        """
+        Decrypt a raw TMSG payload (bytes or hex) with this wallet's keys (UNLOCKED required).
+
+        Tries the canonical key and the BIP-84 / BIP-44 keys at account/change/index.
+        Raises TMSGDecryptionError if none opens it.
+        """
+        from .tmsg.crypto import decrypt
+
+        self._require_unlocked("decrypt_tmsg")
+        return decrypt(payload, self._candidate_keys(account, change, index))
+
+    def decrypt_tmsg_transaction(
+        self,
+        source,
+        *,
+        rpc=None,
+        account: int = 0,
+        change: int = 0,
+        index: int = 0,
+    ):
+        """
+        Decrypt the TMSG(s) inside a transaction (Transaction, raw hex, or txid with ``rpc``).
+
+        Returns a list of DecryptedMessage (``.output_index``, ``.plaintext``, ``.text``).
+        """
+        from .tmsg.onchain import decrypt_transaction
+
+        self._require_unlocked("decrypt_tmsg_transaction")
+        return decrypt_transaction(source, self._candidate_keys(account, change, index), rpc=rpc)
+
     # ------------------------------------------------------------------
     # Internal constructor helper
     # ------------------------------------------------------------------
 
     @classmethod
     def _from_seed(cls, seed: bytes, mnemonic: str = "") -> "Wallet":
-        """Build an UNLOCKED HD wallet from a raw seed."""
+        """Build an UNLOCKED HD wallet from a raw seed (canonical: BIP-44 P2PKH)."""
         if len(seed) != 64:
             raise WalletError(f"Invalid seed length: {len(seed)}")
+
+        from .keys.ec import privkey_to_pubkey
 
         w = cls()
         w._wallet_type    = "hd"
         w._seed           = seed
         w._mnemonic       = mnemonic
-        w.derivation_path = DERIVATION_PATH
+        w.derivation_path = DERIVATION_PATH  # m/44'/5353'/0'/0/0
         w.account_index   = 0
         w.change_index    = 0
         w.address_index   = 0
         w.is_watch_only   = False
         w._locked         = False
 
-        priv, pub, addr   = get_default_address_from_seed(seed)
-        w._private_key    = priv
-        w.public_key      = pub
-        w.address         = addr
+        # Canonical key: BIP-44 P2PKH (m/44'/COIN_TYPE'/0'/0/0)
+        path = f"m/{BIP44_PURPOSE}'/{COIN_TYPE}'/0'/0/0"
+        priv, _ = derive_path_from_seed(seed, path)
+        pub = privkey_to_pubkey(priv, compressed=True)
+        addr = pubkey_to_p2pkh_address(pub)
+
+        w._private_key = priv
+        w.public_key   = pub.hex()
+        w.address      = addr
 
         return w
 

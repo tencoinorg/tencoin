@@ -135,3 +135,39 @@ def pubkey_to_p2sh_p2pkh_address(pubkey: bytes, version: int = P2SH_VERSION) -> 
     """
     redeem = build_p2pkh_script(pubkey)
     return script_to_p2sh_address(redeem, version)
+
+
+def build_p2wpkh_redeem_script(pubkey: bytes) -> bytes:
+    """
+    Build the witness-v0 "redeem script" used to nest a P2WPKH output
+    inside P2SH, per BIP-49: OP_0 <20-byte-hash160(pubkey)>.
+
+    Args:
+        pubkey: 33-byte compressed public key
+
+    Returns:
+        22-byte redeem script (0x00 0x14 <20-byte-hash>)
+    """
+    if len(pubkey) != 33:
+        raise ScriptError(f"Compressed pubkey must be 33 bytes, got {len(pubkey)}")
+    h = hash160(pubkey)
+    return bytes([OP_0, 0x14]) + h
+
+
+def pubkey_to_p2sh_p2wpkh_address(pubkey: bytes, version: int = P2SH_VERSION) -> str:
+    """
+    Build a BIP-49 nested SegWit address: P2SH-wrapped P2WPKH (single-sig, M...).
+
+    This is the standard BIP-49 "P2SH-P2WPKH" address, distinct from
+    ``pubkey_to_p2sh_p2pkh_address`` (which wraps a legacy P2PKH script,
+    not a witness program).
+
+    Args:
+        pubkey: 33-byte compressed public key
+        version: P2SH version byte (default mainnet 0x32)
+
+    Returns:
+        Base58Check P2SH address
+    """
+    redeem = build_p2wpkh_redeem_script(pubkey)
+    return script_to_p2sh_address(redeem, version)
