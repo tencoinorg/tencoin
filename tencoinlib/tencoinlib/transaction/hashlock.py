@@ -444,15 +444,21 @@ def sign_hashlock_input(
             "SHA256(preimage) does not match the secret_hash of this UTXO (wrong secret)"
         )
 
-    if not isinstance(private_key, (bytes, bytearray)) or len(private_key) != 32:
-        raise HashlockSpendSigningError("private_key must be 32 bytes")
-    private_key = bytes(private_key)
+    from ..keys.wif import WIFError, to_private_key_bytes
     try:
-        from ..keys.ec import privkey_to_pubkey, sign
-        pub = privkey_to_pubkey(private_key, compressed=True)
+        private_key = to_private_key_bytes(private_key)     # 32 bytes, hex or WIF (any form)
+    except WIFError as exc:
+        raise HashlockSpendSigningError(f"invalid private key: {exc}") from exc
+    try:
+        from ..keys.ec import sign
+        from ..keys.pubkey import public_key_for_hash160
+        # SegWit owners need the compressed key; legacy P2PKH owners may use either form
+        pub = public_key_for_hash160(
+            private_key, u.owner_hash, allow_uncompressed=(u.owner_type == "p2pkh")
+        )
     except Exception as exc:
         raise HashlockSpendSigningError(f"Invalid private key: {exc}") from exc
-    if not hmac.compare_digest(hash160(pub), u.owner_hash):
+    if pub is None:
         raise HashlockSpendSigningError(
             "This private key does not own the UTXO (pubkey hash differs from the owner script)"
         )

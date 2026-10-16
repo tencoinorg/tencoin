@@ -274,16 +274,29 @@ class Wallet:
         available on this wallet type and raise WalletError.
 
         Args:
-            private_key: 32-byte private key, as bytes or a 64-char hex string.
+            private_key: 32 bytes, a 64-char hex string, or a WIF string. The form is
+                         detected automatically. A WIF of an UNCOMPRESSED key is refused:
+                         this wallet only uses compressed keys, so it would not have the
+                         address that key's funds are at (spend those with the signer
+                         classes instead, see keys.wif.decode_wif).
 
         Returns:
             UNLOCKED Wallet instance (wallet_type == "privkey").
         """
         from .keys.ec import privkey_to_pubkey
+        from .keys.wif import WIFError, parse_private_key
 
-        key_bytes = bytes.fromhex(private_key) if isinstance(private_key, str) else private_key
-        if len(key_bytes) != 32:
-            raise WalletError(f"Private key must be 32 bytes, got {len(key_bytes)}")
+        try:
+            info = parse_private_key(private_key)
+        except WIFError as exc:
+            raise WalletError(f"Invalid private key: {exc}") from exc
+        if info.compressed is False:
+            raise WalletError(
+                "This WIF is for an UNCOMPRESSED key, but wallets only use compressed keys: "
+                "the wallet address would differ from the address that WIF controls. "
+                "Use keys.wif.decode_wif() and the signer classes for uncompressed keys."
+            )
+        key_bytes = info.private_key
 
         pub  = privkey_to_pubkey(key_bytes, compressed=True)
         addr = pubkey_to_p2pkh_address(pub)
@@ -589,6 +602,17 @@ class Wallet:
         if self.is_watch_only or self._private_key is None:
             raise WalletError("Private key not available in watch-only wallet")
         return self._private_key.hex()
+
+    def get_private_key_wif(self, compressed: bool = True) -> str:
+        """
+        Get the canonical private key as WIF (UNLOCKED required).
+
+        ``compressed=True`` (default) matches this wallet's public key and addresses.
+        The WIF version byte is ``constants.WIF_VERSION``.
+        """
+        from .keys.wif import hex_to_wif
+
+        return hex_to_wif(self.get_private_key_hex(), compressed=compressed)
 
     def get_public_key_hex(self) -> str:
         """Get canonical public key as hex (available while locked)."""

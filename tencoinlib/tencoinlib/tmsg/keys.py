@@ -21,7 +21,6 @@ PublicKeyLike = Union[bytes, bytearray, str, PublicKeyInfo]
 PrivateKeyLike = Union[bytes, bytearray, str]
 
 _HEX_PUBKEY = re.compile(r"^(?:0x)?(?:[0-9a-fA-F]{66}|[0-9a-fA-F]{130})$")
-_HEX_PRIVKEY = re.compile(r"^(?:0x)?[0-9a-fA-F]{64}$")
 _SEPARATORS = re.compile(r"[\s,;]+")
 
 
@@ -121,18 +120,18 @@ def parse_public_keys(
 
 
 def normalize_private_key(key: PrivateKeyLike) -> bytes:
-    """Return a validated 32-byte private key (bytes or 64-char hex accepted)."""
-    if isinstance(key, (bytes, bytearray)):
-        raw = bytes(key)
-    elif isinstance(key, str):
-        text = key.strip()
-        if not _HEX_PRIVKEY.match(text):
-            raise TMSGKeyError("private key must be 64 hex characters")
-        raw = bytes.fromhex(text[2:] if text[:2].lower() == "0x" else text)
-    else:
-        raise TMSGKeyError(f"private key must be bytes or hex str, got {type(key).__name__}")
-    if len(raw) != 32:
-        raise TMSGKeyError(f"private key must be 32 bytes, got {len(raw)}")
+    """
+    Return a validated 32-byte private key.
+
+    Accepts 32 bytes, 64 hex characters, or a WIF string (compressed or uncompressed: the
+    form is detected automatically; the compression flag is irrelevant for decrypting).
+    """
+    from ..keys.wif import WIFError, to_private_key_bytes
+
+    try:
+        raw = to_private_key_bytes(key)
+    except WIFError as exc:
+        raise TMSGKeyError(f"invalid private key: {exc}") from exc
     try:
         load_coincurve().PrivateKey(raw)            # rejects 0 and values >= curve order
     except TMSGDependencyError:

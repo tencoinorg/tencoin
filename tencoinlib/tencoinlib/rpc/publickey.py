@@ -12,42 +12,10 @@ that the returned key really hashes to the requested address.
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
 
-from ..constants import SECP256K1_FIELD_PRIME as _P
+from ..keys.pubkey import compress_public_key
 from ..transaction.address import AddressError, decode_address
 from ..utils import hash160
 from .exceptions import PublicKeyNotFoundError, PublicKeyVerificationError, ResponseError
-
-
-def _on_curve(x: int, y: int) -> bool:
-    return 0 < x < _P and 0 < y < _P and (y * y - x * x * x - 7) % _P == 0
-
-
-def compress_public_key(pubkey: bytes) -> bytes:
-    """
-    Return the 33-byte compressed form of a compressed or uncompressed public key.
-
-    Raises:
-        ValueError: wrong length / prefix, or the point is not on secp256k1.
-    """
-    pubkey = bytes(pubkey)
-    if len(pubkey) == 33 and pubkey[0] in (2, 3):
-        x = int.from_bytes(pubkey[1:], "big")
-        if not 0 < x < _P:
-            raise ValueError("public key x-coordinate out of range")
-        y_sq = (pow(x, 3, _P) + 7) % _P
-        y = pow(y_sq, (_P + 1) // 4, _P)
-        if (y * y) % _P != y_sq:
-            raise ValueError("public key is not a point on secp256k1")
-        return pubkey
-    if len(pubkey) == 65 and pubkey[0] == 4:
-        x = int.from_bytes(pubkey[1:33], "big")
-        y = int.from_bytes(pubkey[33:], "big")
-        if not _on_curve(x, y):
-            raise ValueError("public key is not a point on secp256k1")
-        return bytes([2 + (y & 1)]) + pubkey[1:33]
-    raise ValueError(
-        f"public key must be 33 bytes (02/03...) or 65 bytes (04...), got {len(pubkey)} bytes"
-    )
 
 
 def public_key_matches_address(pubkey: bytes, address: str) -> bool:

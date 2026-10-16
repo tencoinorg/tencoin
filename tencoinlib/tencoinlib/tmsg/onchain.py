@@ -44,6 +44,7 @@ from ..transaction.builder import TransactionBuilder, TransactionBuilderError
 from ..transaction.core import Transaction, TxIn, TxOut, parse_transaction
 from ..transaction.fee import FeeCalculator
 from ..transaction.signer import LegacySigner, SegWitSigner, _push_data
+from ..keys.pubkey import private_key_to_public_key
 from ..utils import hash160
 from . import crypto
 from .errors import TMSGDecryptionError, TMSGError, TMSGFormatError, TMSGKeyError, TMSGSizeError
@@ -205,12 +206,16 @@ class TMSGTransaction:
         Raises:
             TMSGKeyError: some input has no matching key.
         """
-        pool = {}
+        compressed_pool, legacy_pool = {}, {}
         for key in normalize_private_keys(private_keys):
-            pool[hash160(public_key_from_private_key(key))] = key
+            compressed_pool[hash160(private_key_to_public_key(key, True))] = key
+            # legacy P2PKH outputs may commit to the UNCOMPRESSED public key
+            legacy_pool[hash160(private_key_to_public_key(key, False))] = key
         keys = []
         for i, inp in enumerate(self._inputs):
-            key = pool.get(inp.owner_hash)
+            key = compressed_pool.get(inp.owner_hash)
+            if key is None and inp.kind == "p2pkh":
+                key = legacy_pool.get(inp.owner_hash)
             if key is None:
                 raise TMSGKeyError(f"no private key matches input {i} ({inp.txid}:{inp.vout})")
             keys.append(key)

@@ -14,6 +14,19 @@ class SigningError(Exception):
 # Script push helpers
 # ---------------------------------------------------------------------------
 
+def _key_bytes(key) -> bytes:
+    """A private key given as bytes, hex or WIF (compressed or uncompressed) -> 32 bytes."""
+    if isinstance(key, (bytes, bytearray)):
+        return bytes(key)
+    if isinstance(key, str):
+        from ..keys.wif import WIFError, to_private_key_bytes
+        try:
+            return to_private_key_bytes(key)
+        except WIFError as exc:
+            raise SigningError(str(exc)) from exc
+    raise SigningError(f"private key must be bytes, hex or WIF, got {type(key).__name__}")
+
+
 def _push_data(data: bytes) -> bytes:
     """
     Encode a data push for use inside a scriptSig (Bitcoin Script rules).
@@ -69,6 +82,9 @@ def _normalise_keys(
            [key_a, [key_b1, key_b2], key_c]
            → [[key_a], [key_b1, key_b2], [key_c]]
 
+    Every key may be raw bytes, a 64-char hex string, or a WIF string; the form
+    (and, for a WIF, compressed/uncompressed) is detected automatically.
+
     The first key in each sub-list is the "primary" key passed to legacy
     single-sig helpers; all keys in the sub-list are available for multisig.
     cosigner_keys in utxo dicts are MERGED with the keys provided here, so
@@ -76,12 +92,12 @@ def _normalise_keys(
     """
     result: List[List[bytes]] = []
     for item in private_keys:
-        if isinstance(item, (bytes, bytearray)):
-            result.append([bytes(item)])
+        if isinstance(item, (bytes, bytearray, str)):
+            result.append([_key_bytes(item)])
         elif isinstance(item, list):
             if not item:
                 raise SigningError("Empty key list for an input is not allowed")
-            result.append([bytes(k) for k in item])
+            result.append([_key_bytes(k) for k in item])
         else:
             raise SigningError(
                 f"private_keys must contain bytes or List[bytes], got {type(item)}"
@@ -208,6 +224,24 @@ def _sign_multisig(
 # SegWitSigner
 # ---------------------------------------------------------------------------
 
+def _p2pkh_public_key(private_key: bytes, script: bytes) -> bytes:
+    """
+    Public key to reveal for a P2PKH-style script (``76 a9 14 <hash160> 88 ac``).
+
+    Compressed by default; the uncompressed form when the script's hash is that of the
+    uncompressed key. Any other script keeps the historical behaviour (compressed).
+    """
+    from ..keys.ec import privkey_to_pubkey
+    from ..keys.pubkey import public_key_for_hash160
+
+    script = bytes(script)
+    if len(script) == 25 and script[:3] == b"\x76\xa9\x14" and script[23:] == b"\x88\xac":
+        match = public_key_for_hash160(private_key, script[3:23])
+        if match is not None:
+            return match
+    return privkey_to_pubkey(private_key, compressed=True)
+
+
 class SegWitSigner:
     """
     Signs P2WPKH and P2WSH inputs (BIP-143).
@@ -236,6 +270,7 @@ class SegWitSigner:
         sighash_type: int = 1,
     ) -> bytes:
         try:
+            private_key = _key_bytes(private_key)
             digest = SegWitSigner.bip143_digest(
                 tx, input_index, script_code, value, sighash_type
             )
@@ -290,9 +325,10 @@ class SegWitSigner:
         utxo: dict,
         private_key: bytes,
     ):
-        """Sign a P2WPKH input. Sets witness = [sig, pubkey]."""
+        """Sign a P2WPKH input. Sets witness = [sig, pubkey]. The key may be bytes, hex or WIF."""
         from ..keys.ec import privkey_to_pubkey
 
+        private_key = _key_bytes(private_key)
         public_key = privkey_to_pubkey(private_key, compressed=True)
         pubkey_hash = hash160(public_key)
         script_code = bytes([0x76, 0xa9, 0x14]) + pubkey_hash + bytes([0x88, 0xac])
@@ -535,10 +571,17 @@ class LegacySigner:
         script_pubkey: bytes,
         sighash_type: int = 1,
     ):
-        """Sign a P2PKH input. scriptSig = <sig> <pubkey>."""
-        from ..keys.ec import privkey_to_pubkey, sign
+        """
+        Sign a P2PKH input. scriptSig = <sig> <pubkey>.
 
-        public_key = privkey_to_pubkey(private_key, compressed=True)
+        The pubkey is the compressed one, unless the script commits to the hash of the
+        UNCOMPRESSED public key of this private key (legacy addresses): then that form is used.
+        The key may be bytes, hex or WIF; its compression flag does not matter, the script decides.
+        """
+        from ..keys.ec import sign
+
+        private_key = _key_bytes(private_key)
+        public_key = _p2pkh_public_key(private_key, script_pubkey)
         digest = LegacySigner.legacy_digest(tx, input_index, script_pubkey, sighash_type)
         signature = sign(private_key, digest) + bytes([sighash_type])
 
@@ -556,9 +599,10 @@ class LegacySigner:
         Sign a single-sig P2SH input (P2SH-P2PKH style).
         scriptSig = <sig> <pubkey> <redeem_script>
         """
-        from ..keys.ec import privkey_to_pubkey, sign
+        from ..keys.ec import sign
 
-        public_key = privkey_to_pubkey(private_key, compressed=True)
+        private_key = _key_bytes(private_key)
+        public_key = _p2pkh_public_key(private_key, redeem_script)
         digest = LegacySigner.legacy_digest(tx, input_index, redeem_script, sighash_type)
         signature = sign(private_key, digest) + bytes([sighash_type])
 
@@ -583,6 +627,7 @@ class LegacySigner:
         private_keys_for_input must contain at least m keys matching pubkeys
         in the redeem script.
         """
+        private_keys_for_input = [_key_bytes(k) for k in private_keys_for_input]
         digest = LegacySigner.legacy_digest(tx, input_index, redeem_script, sighash_type)
         signatures = _sign_multisig(private_keys_for_input, digest, redeem_script)
 

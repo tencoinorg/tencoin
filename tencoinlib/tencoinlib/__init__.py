@@ -26,6 +26,14 @@ from .wallet import Wallet, WalletError
 from .rpc import (
     RPCClient, RPCError, PublicKeyInfo, PublicKeyNotFoundError, PublicKeyVerificationError,
 )
+from .keys.wif import (
+    WIFKey, WIFError, WIF_VERSION, PrivateKeyInfo, encode_wif, decode_wif, hex_to_wif, wif_to_hex,
+    parse_private_key, to_private_key_bytes,
+)
+from .keys.pubkey import (
+    compress_public_key, decompress_public_key, convert_public_key,
+    private_key_to_public_key, public_key_to_address,
+)
 from . import tmsg
 from .tmsg import (
     TMSGError, TMSGKeyError, TMSGFormatError, TMSGDecryptionError, TMSGSizeError,
@@ -75,7 +83,7 @@ from .secret import (
 )
 
 # Version
-__version__ = "0.4.0"
+__version__ = "0.4.2"
 
 __all__ = [
     # Constants
@@ -106,6 +114,21 @@ __all__ = [
     "PublicKeyNotFoundError",
     "PublicKeyVerificationError",
     "tmsg",
+    "WIFKey",
+    "PrivateKeyInfo",
+    "parse_private_key",
+    "to_private_key_bytes",
+    "WIFError",
+    "WIF_VERSION",
+    "encode_wif",
+    "decode_wif",
+    "hex_to_wif",
+    "wif_to_hex",
+    "compress_public_key",
+    "decompress_public_key",
+    "convert_public_key",
+    "private_key_to_public_key",
+    "public_key_to_address",
     "TMSGError",
     "TMSGKeyError",
     "TMSGFormatError",

@@ -47,6 +47,7 @@ Complete and comprehensive documentation for the Tencoinlib Python library.
 - ✅ **Transaction Signing**: Automatic detection and signing for SegWit (BIP-143), Legacy (P2PKH/P2SH), and Multisig (P2SH/P2WSH, any m-of-n up to 15-of-15) inputs
 - ✅ **Message Signing**: Bitcoin Core–compatible message signing and verification with public key recovery
 - ✅ **HASHLOCK (C2) Outputs**: Create hash-locked outputs and spend them (owner signature + secret preimage) — in one call with `wallet.spend_hashlock()` or step by step
+- ✅ **WIF Conversion**: `hex_to_wif()` / `wif_to_hex()` with compressed and uncompressed keys, public-key compression, decompression and address derivation for both forms — and every signing / decryption function accepts bytes, hex or WIF, with the key form detected automatically
 - ✅ **TMSG (Tencoin Message)**: Encrypt messages, files and folders to one public key (v1) or many (v2, any one private key decrypts) — off-chain, or on-chain in an `OP_RETURN` output (up to 958 bytes of message)
 - ✅ **getpublickey**: Find the public key of an address on-chain (`rpc.get_public_key()`), verified locally against the address
 - ✅ **TCS Secrets**: Generate and validate `TCS-...` secrets (64 characters including a checksum) in exactly the format used by Tencoin Core
@@ -2461,6 +2462,110 @@ signature = sign(private_key, msg_hash)
 is_valid = verify(public_key, msg_hash, signature)
 ```
 
+### WIF and Public Key Formats
+
+**WIF (Wallet Import Format)** is the text form of a private key. These functions convert between the 64-character hex form and WIF, and keep track of whether the key is **compressed** or **uncompressed**.
+
+```python
+from tencoinlib import hex_to_wif, wif_to_hex, decode_wif
+
+hex_key = "c0e144ad504e04e46ae829c770b524a429d9818b87f51c0e54ce6a1adb3327d3"
+
+# hex -> WIF
+wif = hex_to_wif(hex_key)                         # compressed (default)
+wif_old = hex_to_wif(hex_key, compressed=False)   # uncompressed (legacy form)
+
+# WIF -> hex
+wif_to_hex(wif)                                   # "c0e144ad..." (the same for both forms)
+
+# WIF -> everything: key, compression flag, public key, addresses
+key = decode_wif(wif)
+key.hex                  # private key, 64 hex chars
+key.compressed           # True / False
+key.public_key_hex       # 33-byte (compressed) or 65-byte (uncompressed) public key, in hex
+key.address()            # P2PKH address of this key form
+key.addresses()          # {"p2pkh": ..., "p2wpkh": ..., "p2sh-p2wpkh": ...}  (SegWit kinds only if compressed)
+```
+
+**How WIF works.** `WIF = Base58Check(version ‖ private key [‖ 0x01])`. The optional trailing `0x01` marks a **compressed** key.
+
+| | Compressed WIF | Uncompressed WIF |
+|---|---|---|
+| Length | 52 characters | 51 characters |
+| Public key | 33 bytes (`02`/`03` + x) | 65 bytes (`04` + x + y) |
+| P2PKH address (`T...`) | one address | a **different** address |
+| SegWit addresses (`tc1q...`, `M...`) | yes | **no** (SegWit requires compressed keys) |
+
+The hex form of the private key is the same for both. Only the WIF (and therefore the public key and the address) differs, so always keep the flag when you move a key between wallets: an uncompressed WIF stands for the *uncompressed* address, and funds sent to that address are only spendable with the uncompressed public key.
+
+**Version byte.** The default is `WIF_VERSION` (`0xC1`). This value follows the convention of the Bitcoin family (`P2PKH version + 0x80`); check it against a WIF produced by your node or wallet. Every function accepts `version=` to use another byte, and `decode_wif(wif, version=None)` accepts any version (it is reported in `key.version`). A WIF with a different version is rejected by default, so a key of another network is not imported by accident.
+
+```python
+decode_wif(wif_from_somewhere, version=None).version     # which version byte does it use?
+hex_to_wif(hex_key, version=0x80)                          # Bitcoin-style WIF
+```
+
+**Invalid input.** A bad character or checksum, a wrong length, a compression flag other than `0x01`, a wrong version, or a private key outside `1 … curve order − 1` raises `WIFError` (a `ValueError`). `hex_to_wif` accepts 64 hex characters (upper or lower case, optional `0x`, surrounding whitespace) or 32 bytes.
+
+#### Compressed and uncompressed public keys
+
+```python
+from tencoinlib import (
+    private_key_to_public_key, compress_public_key, decompress_public_key,
+    convert_public_key, public_key_to_address,
+)
+
+priv = bytes.fromhex(hex_key)
+pub_c = private_key_to_public_key(priv, compressed=True)     # 33 bytes
+pub_u = private_key_to_public_key(priv, compressed=False)    # 65 bytes
+
+compress_public_key(pub_u) == pub_c        # True
+decompress_public_key(pub_c) == pub_u      # True
+convert_public_key(pub_c, compressed=False)
+
+public_key_to_address(pub_c)                  # T... (P2PKH)
+public_key_to_address(pub_u)                  # T... (a different P2PKH address)
+public_key_to_address(pub_c, "p2wpkh")        # tc1q...
+public_key_to_address(pub_u, "p2wpkh")        # ValueError: SegWit needs a compressed key
+```
+
+All functions validate the point: a key that is not on the secp256k1 curve raises `ValueError`.
+
+**Spending from an uncompressed address.** `LegacySigner.sign_p2pkh_input()` reveals the public key that the output script commits to: the compressed key normally, the uncompressed key when the P2PKH script holds the hash of the uncompressed key. The same applies to `sign_p2sh_singlesig_input()`, HASHLOCK spends of P2PKH owners (`spend_hashlock`) and `TMSGTransaction.sign()`. SegWit inputs always use the compressed key.
+
+#### Passing keys: bytes, hex or WIF — detected automatically
+
+Wherever the library takes a private key to **sign or decrypt**, you can pass it as 32 bytes, as 64 hex characters (`0x` allowed), or as a **WIF string** (compressed or uncompressed). The form is detected automatically; for a WIF the compression flag is read from it.
+
+```python
+from tencoinlib import TransactionSigner, spend_hashlock, tmsg, parse_private_key
+
+# Any form works, even mixed in one call
+signed = TransactionSigner.sign_transaction(tx, utxos, [wif_a, "c0e144ad...", key_bytes])
+
+spend_hashlock(utxo, wif, "tc1q...", secret=secret)            # HASHLOCK spend
+tx_tmsg.sign(wif)                                              # TMSG transaction
+tmsg.decrypt(payload, wif)                                     # TMSG decryption
+
+info = parse_private_key(user_input)                           # what did I get?
+info.format                # "bytes" | "hex" | "wif"
+info.compressed            # True / False for a WIF, None for bytes / hex
+info.private_key           # the 32 bytes
+```
+
+This covers `TransactionSigner`, `LegacySigner`, `SegWitSigner` (`sign_transaction` and the single-input methods), `spend_hashlock()` / `sign_hashlock_input()`, `TMSGTransaction.sign()`, `tmsg.decrypt()` / `decrypt_text()` / `decrypt_file()` / `decrypt_folder()` / `decrypt_transaction()`, and `Wallet.from_private_key()`. A key that is none of the three forms raises the error of that function (`SigningError`, `TMSGKeyError`, `HashlockSpendSigningError`, `WalletError`), always saying that it is neither 64 hex characters nor a valid WIF. A WIF of another version byte is rejected (see *Version byte*).
+
+**The WIF's compression flag does not decide what is signed.** The *output script* decides: for a P2PKH output the signer reveals whichever public key (compressed or uncompressed) hashes to the address in the script, so a compressed WIF can spend an uncompressed-address output of the same key and the other way round. SegWit outputs always use the compressed key.
+
+**Wallet.** `Wallet.from_private_key()` accepts bytes, hex or a compressed WIF, and `wallet.get_private_key_wif()` exports the key. A wallet only uses compressed keys, so `Wallet.from_private_key()` **refuses an uncompressed WIF** (its address would differ from the one that WIF controls). For those keys use `decode_wif()` and the signers above.
+
+```python
+wallet = Wallet.from_private_key("KwDi...")          # compressed WIF
+wallet.get_private_key_wif()                         # back to WIF (compressed=True default)
+```
+
+**Security.** Never log, print or store a WIF or a private key in plain text. `WIFKey.__repr__` hides the key.
+
 ---
 
 ## Message Signing
@@ -3347,10 +3452,10 @@ print(f"\nNext Receiving Address: {next_addr}")
 - Full private derivation is available, but no mnemonic/seed is required
 
 **`Wallet.from_private_key(private_key: Union[bytes, str]) -> Wallet`**
-- Create a wallet from a single raw 32-byte private key (bytes, or a 64-char hex string) — no mnemonic, no seed, and no BIP-32 chain code
+- Create a wallet from a single raw 32-byte private key (bytes, a 64-char hex string, or a WIF string; the form is detected automatically) — no mnemonic, no seed, and no BIP-32 chain code
 - Canonical address is legacy P2PKH; distinct from `from_xprv()`, which carries a chain code and can derive a full tree
 - **Returns**: `Wallet` instance (UNLOCKED), `wallet_type == "privkey"`
-- **Raises**: `WalletError` if the key is not exactly 32 bytes
+- **Raises**: `WalletError` if the key is not a valid 32-byte key / hex / WIF, or if it is a WIF of an **uncompressed** key (wallets only use compressed keys; use `decode_wif()` and the signer classes for those)
 - Operations requiring a chain code (`get_master_xprv`/`xpub`, `derive_xprv`/`xpub`, `get_account_xprv`/`xpub`, `get_address("p2wpkh")`/`get_address("p2sh")`) raise `WalletError` on this wallet type
 
 **`Wallet.load(filepath: str) -> Wallet`**
@@ -3405,6 +3510,10 @@ print(f"\nNext Receiving Address: {next_addr}")
 
 **`get_private_key_hex() -> str`**
 - Get private key as hex string (UNLOCKED required)
+- **Raises**: `WalletLockedError`, `WalletError` in watch-only wallets
+
+**`get_private_key_wif(compressed: bool = True) -> str`**
+- Get the canonical private key as WIF (UNLOCKED required); `compressed=True` matches the wallet's public key and addresses. Uses `WIF_VERSION`
 - **Raises**: `WalletLockedError`, `WalletError` in watch-only wallets
 
 **`get_public_key_hex() -> str`**
@@ -3668,6 +3777,7 @@ Legacy transaction signer for P2PKH and P2SH addresses.
 
 **`sign_p2pkh_input(tx: Transaction, input_index: int, private_key: bytes, script_pubkey: bytes, sighash_type: int = 1)`**
 - Sign a P2PKH input. Produces `scriptSig = <sig> <pubkey>`.
+- The public key is the compressed one, unless `script_pubkey` commits to the hash of the **uncompressed** public key of `private_key` (legacy address): then the 65-byte key is used.
 - **Parameters**:
   - `tx` - Transaction (modified in place)
   - `input_index` - Input index to sign
@@ -4086,6 +4196,72 @@ from tencoinlib.rpc import PublicKeyInfo, public_key_matches_address, compress_p
 **`compress_public_key(pubkey: bytes) -> bytes`**
 - 33-byte compressed form of a 33- or 65-byte key; `ValueError` if the point is not on secp256k1
 
+### WIF Module
+
+```python
+from tencoinlib import (
+    hex_to_wif, wif_to_hex, encode_wif, decode_wif, WIFKey, WIFError, WIF_VERSION,
+)
+```
+
+**`hex_to_wif(hex_key: Union[str, bytes], compressed: bool = True, version: int = WIF_VERSION) -> str`**
+- Private key (64 hex chars, `0x` and whitespace allowed, or 32 bytes) → WIF. `compressed=False` gives the legacy uncompressed form
+- **Raises**: `WIFError` (bad length / characters, key out of range, bad version)
+
+**`wif_to_hex(wif: str, version: Optional[int] = WIF_VERSION) -> str`**
+- WIF → private key hex (64 chars, lower case). The compression flag is not part of the hex: use `decode_wif()` to get it
+- `version=None` accepts any version byte
+- **Raises**: `WIFError`
+
+**`encode_wif(private_key: Union[bytes, str], compressed: bool = True, version: int = WIF_VERSION) -> str`**
+- Same as `hex_to_wif` (it also takes bytes)
+
+**`decode_wif(wif: str, version: Optional[int] = WIF_VERSION) -> WIFKey`**
+- Decode a WIF. Checks the Base58 checksum, the length, the compression flag (`0x01`), the version and the key range
+- **Raises**: `WIFError`
+
+**`WIFKey`** (frozen dataclass; its `repr` hides the key)
+- Fields: `private_key` (bytes), `compressed` (bool), `version` (int)
+- Properties: `hex`, `public_key` (33 bytes if compressed, else 65), `public_key_hex`, `wif`
+- `address(kind: str = "p2pkh") -> str` — `"p2pkh"`, `"p2wpkh"` or `"p2sh-p2wpkh"` (SegWit kinds raise `ValueError` for uncompressed keys)
+- `addresses() -> Dict[str, str]` — every address this key can have
+
+**`parse_private_key(value: Union[bytes, str], version: Optional[int] = WIF_VERSION) -> PrivateKeyInfo`**
+- Accept a private key in any supported form and detect it: 32 bytes, 64 hex characters (`0x` and whitespace allowed) or a WIF
+- **Returns**: `PrivateKeyInfo` with `private_key` (32 bytes), `format` (`"bytes"`, `"hex"` or `"wif"`), `compressed` (`True`/`False` for a WIF, `None` for bytes and hex) and `version` (WIF only); its `repr` hides the key
+- **Raises**: `WIFError`
+
+**`to_private_key_bytes(value: Union[bytes, str], version: Optional[int] = WIF_VERSION) -> bytes`**
+- The 32-byte private key from bytes, hex or WIF
+
+**`WIFError(ValueError)`**, **`WIF_VERSION`** (`0xC1`, see [Constants](#constants-and-configuration))
+
+### Public Key Format Functions
+
+```python
+from tencoinlib import (
+    private_key_to_public_key, compress_public_key, decompress_public_key,
+    convert_public_key, public_key_to_address,
+)
+from tencoinlib.keys.pubkey import is_compressed, public_key_for_hash160
+```
+
+**`private_key_to_public_key(private_key: bytes, compressed: bool = True) -> bytes`**
+- Public key of a 32-byte private key: 33 bytes (compressed) or 65 bytes (uncompressed)
+
+**`compress_public_key(pubkey: bytes) -> bytes`** / **`decompress_public_key(pubkey: bytes) -> bytes`**
+- Convert a compressed or uncompressed public key to the 33-byte / 65-byte form
+- **Raises**: `ValueError` for a wrong length or prefix, or a point that is not on secp256k1
+
+**`convert_public_key(pubkey: bytes, compressed: bool) -> bytes`**, **`is_compressed(pubkey: bytes) -> bool`**
+
+**`public_key_to_address(pubkey: bytes, kind: str = "p2pkh") -> str`**
+- `"p2pkh"` works for both forms (each form has its own address); `"p2wpkh"` and `"p2sh-p2wpkh"` need a compressed key
+- **Raises**: `ValueError`
+
+**`public_key_for_hash160(private_key: bytes, target_hash: bytes, *, allow_uncompressed: bool = True) -> Optional[bytes]`**
+- The public key of `private_key` whose HASH160 equals `target_hash` (compressed first, then uncompressed), or `None`
+
 ---
 
 ## Error Handling
@@ -4273,6 +4449,19 @@ except HashlockError as e:
 
 Errors from `add_hashlock_output()` (creating a HASHLOCK output) are `TransactionBuilderError`; the `TCS-` helpers (`secret_to_preimage()`, `check_secret()`, ...) raise `SecretError`.
 
+### WIF Errors
+
+```python
+from tencoinlib import WIFError, hex_to_wif, decode_wif
+
+try:
+    key = decode_wif(user_input)
+except WIFError as e:
+    print(f"Invalid WIF: {e}")     # bad checksum / characters, wrong length or flag, wrong version, key out of range
+```
+
+`WIFError` is a `ValueError`. Public-key helpers (`compress_public_key`, `decompress_public_key`, `public_key_to_address`, ...) raise a plain `ValueError`.
+
 ### TMSG Errors
 
 ```
@@ -4364,6 +4553,14 @@ FeeCalculator.DEFAULT_FEE_RATE    # 20 Tenos/byte
 FeeCalculator.PRIORITY_FEE_RATE   # 50 Tenos/byte
 FeeCalculator.ECONOMY_FEE_RATE    # 10 Tenos/byte
 ```
+
+### WIF Constants
+
+```python
+from tencoinlib import WIF_VERSION        # 0xC1 - version byte of WIF private keys
+```
+
+`WIF_VERSION` is `P2PKH_VERSION + 0x80`, the convention of the Bitcoin family. It is an assumption: confirm it against a WIF exported by your node or wallet. All WIF functions take `version=` to override it.
 
 ### TMSG and OP_RETURN Constants
 
@@ -4495,6 +4692,20 @@ from tencoinlib.constants import (
 8. **Use change addresses**
    - Always set a change address to protect privacy
    - Use new change addresses for each transaction
+
+### WIF and Private Keys
+
+1. **Never log, print or store a private key or WIF in plain text**
+   - A WIF is the whole key. Treat it like a password and show it only to its owner
+
+2. **Keep the compression flag**
+   - Converting a key to hex loses the flag. If you only keep the hex, remember whether the original WIF was compressed: the two forms give different addresses
+
+3. **Check the address after importing a key**
+   - `decode_wif(wif).addresses()` lists the addresses of the key; compare with the address you expect before sending funds there
+
+4. **Prefer compressed keys for new wallets**
+   - They are smaller and are the only form that can use SegWit addresses. Uncompressed keys only exist for legacy P2PKH addresses
 
 ### TMSG Messages
 

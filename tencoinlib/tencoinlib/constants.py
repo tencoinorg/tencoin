@@ -112,3 +112,11 @@ TMSG_MIN_PAYMENT = 1
 
 # secp256k1 field prime (used for public-key validation)
 SECP256K1_FIELD_PRIME = 0xFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F
+
+
+# ── WIF (Wallet Import Format) ──────────────────────────────────────────
+# ASSUMED, not read from the node: P2PKH_VERSION + 0x80, the convention of the
+# Bitcoin family (Bitcoin 0x00 -> 0x80, Litecoin 0x30 -> 0xB0, Dogecoin 0x1E -> 0x9E).
+# Confirm it against a WIF exported by the node / wallet. Every WIF function takes
+# version= to override it, and version=None accepts any version when decoding.
+WIF_VERSION = 0xC1

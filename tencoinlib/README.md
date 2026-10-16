@@ -32,9 +32,10 @@ Official Python library for Tencoin – HD wallets, transactions, RPC client, an
 * **Encrypted Wallet Files (`.tcw`)**: AES-256-GCM + Argon2id, locked/unlocked state, no plaintext secrets on disk
 * **OP_RETURN Outputs**: On-chain data embedding (up to 80 bytes per output)
 * **TIMELOCK Outputs**: Conditional outputs (flag `0xC1`) that lock funds until a specific block height or Unix timestamp is reached
+* **WIF conversion**: `hex_to_wif()` / `wif_to_hex()` for compressed and uncompressed private keys, public-key compress/decompress, and address derivation for both forms (P2PKH works with either; SegWit needs compressed). Uncompressed P2PKH outputs can be spent. Every signing / decryption function accepts a private key as bytes, hex or WIF and detects the form automatically.
 * **TMSG (Tencoin Message)**: End-to-end encrypted messages, files and folders (ECDH secp256k1 + AES-256-GCM) to one public key (v1) or many (v2), off-chain or on-chain in an `OP_RETURN` output, plus `rpc.get_public_key()` (`getpublickey`) to find a recipient's key.
-* **HASHLOCK Outputs (create and spend)**: Conditional outputs (flag `0xC2`) that lock funds behind a secret (preimage). Create them with `TransactionBuilder.add_hashlock_output()` and spend them with `wallet.spend_hashlock()` (or the step-by-step `build_hashlock_spend()` / `wallet.sign_hashlock_spend()` / `finalize_hashlock_spend()`). Spending needs the owner's signature AND the preimage; the preimage is the last unlocking item (`witness = [sig, pubkey, preimage]` for P2WPKH, `scriptSig = <sig> <pubkey> <preimage>` for P2PKH). C3/C4 outputs are not supported.
-* **TCS Secret Generator**: Generate and verify Tencoin `TCS-...` secrets (HASHLOCK preimages) in exactly the format used by Tencoin Core: `TCS-` + 55 random characters (A-Z, 0-9) + 5-character SHA-256 checksum = 64 characters. The whole text is the preimage (`secret_to_preimage()` / `hash_preimage()`); the checksum is verified for every `TCS-` secret and free-form manual secrets are left untouched
+* **HASHLOCK Outputs**: Create and spend HASHLOCK outputs using a secret and the owner's signature. C3 and C4 are not supported. C3/C4 outputs are not supported.
+* **TCS Secret Generator**: Generate and verify Tencoin secrets in the `TCS-...` format, including checksum validation.
 
 
 ## Installation
@@ -82,7 +83,6 @@ Every contribution helps keep Tencoin **open-source, independent, and continuous
 Thank you for supporting open-source development and the Tencoin ecosystem.
 
 
-
 ## Verify Authenticity
 
 Each release is signed by the official Tencoin developer. You can verify that your installed library is authentic and has not been tampered with:
@@ -107,6 +107,6 @@ print(f"  Authentic         : {'✓ YES' if is_valid else '✗ NO — library ma
 print("=" * 64)
 ```
 
-> **Release:** v0.4.0
+> **Release:** v0.4.2
 > **Developer:** `TASH999uKBUFN1AqAkDjJ8dQqWbXw6G5bh`
-> **Signature:** `IFSzDyC5xeu6DHPk4NA/9YHyRNtTk8fAmbTkcfNBZkLPOKWe9ifLhsh+B5A3TGfnNTbciWggPCvpZ03QeG5AyIU=` 
+> **Signature:** `H8Cs7uL3QH+6e5RssCgVzgkwhZU25z3jr1hh5XoZXjTABnHFJauqH23Qafr96E9WJwh4BRye3R4lVkZrXm8lSMA=`
